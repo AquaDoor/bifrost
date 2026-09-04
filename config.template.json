@@ -21,17 +21,7 @@
     }
   },
   "mcp": {
-    "client_configs": [
-      {
-        "name": "aquadoor-runner",
-        "connection_type": "http",
-        "connection_string": "env.AQUADOOR_RUNNER_MCP_URL",
-        "auth_type": "headers",
-        "headers": { "Authorization": "env.AQUADOOR_RUNNER_BOOTSTRAP_TOKEN" },
-        "allowed_extra_headers": ["Authorization"],
-        "tools_to_execute": ["*"]
-      }
-    ]
+    "client_configs": ${AQUADOOR_RUNNER_MCP_CLIENTS}
   },
   "governance": {
     "auth_config": {
@@ -62,7 +52,7 @@
         "BackendProjectID": "${AQUADOOR_OBO_BACKEND_PROJECT_ID}",
         "UpstreamClientID": "${AQUADOOR_OBO_UPSTREAM_CLIENT_ID}",
         "RunnerToolPrefixes": ["aquadoor-runner-"],
-        "RunnerClients": ["aquadoor-runner"],
+        "RunnerClients": ${AQUADOOR_OBO_RUNNER_CLIENTS},
         "Strategy": "delegation"
       }
     }
