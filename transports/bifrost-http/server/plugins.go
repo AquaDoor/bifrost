@@ -361,22 +361,34 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	// after this builtin and never get a chance to pick the provider first).
 	s.Config.SetPluginOrderInfo(modelcatalogresolver.PluginName, schemas.Ptr(schemas.PluginPlacementPostBuiltin), schemas.Ptr(math.MaxInt))
 
-	// 11. AquaDoor PII egress guardrail (#1780 §7.5). Config-driven (analyzer/anonymizer URLs).
-	// Runs late (after compat) so it redacts the fully-assembled request before egress. Its runtime
-	// fail-closed (Presidio error/timeout → block) lives in the plugin; this only gates registration.
-	piiConfig := s.getPluginConfig("aquadoor-pii")
-	if piiConfig != nil && piiConfig.Enabled {
-		s.registerPluginWithStatus(ctx, "aquadoor-pii", nil, piiConfig.Config, false)
+	// 11. AquaDoor PII egress guardrail (#1780 §7.5). Runs late (after compat) so it redacts the
+	// fully-assembled request before egress; its runtime fail-closed (Presidio error/timeout → block)
+	// lives in the plugin. Self-configuring: registers only when an analyzer URL is set, so the
+	// gateway boots cleanly BEFORE Presidio is deployed (incremental rollout — B1 before B7) instead
+	// of fail-closed-blocking every completion. Cutover (C2) MUST NOT proceed with it disabled — the
+	// loud warning + the C1.4 PII acceptance test enforce that.
+	if piiConfig := s.getPluginConfig("aquadoor-pii"); piiConfig != nil && piiConfig.Enabled {
+		if cfg, _ := MarshalPluginConfig[aquadoorpii.Config](piiConfig.Config); cfg != nil && cfg.AnalyzerURL != "" {
+			s.registerPluginWithStatus(ctx, "aquadoor-pii", nil, piiConfig.Config, false)
+		} else {
+			s.markPluginDisabled("aquadoor-pii")
+			logger.Warn("aquadoor-pii enabled but no AnalyzerURL — PII guardrail is OFF (set AQUADOOR_PRESIDIO_ANALYZER_URL); MUST be configured before cutover")
+		}
 	} else {
 		s.markPluginDisabled("aquadoor-pii")
 	}
 	s.Config.SetPluginOrderInfo("aquadoor-pii", builtinPlacement, schemas.Ptr(10))
 
 	// 12. AquaDoor OBO (#1780 §7.2). MUST run after governance (order 4) so the VK name (= user
-	// email) is stamped in context before GovernanceVKNameResolver reads it. Config-driven.
-	oboConfig := s.getPluginConfig("aquadoor-obo")
-	if oboConfig != nil && oboConfig.Enabled {
-		s.registerPluginWithStatus(ctx, "aquadoor-obo", nil, oboConfig.Config, false)
+	// email) is stamped in context before GovernanceVKNameResolver reads it. Self-configuring:
+	// registers only when an issuer is set (so B1/B2 boot before the OBO actor key exists — B5).
+	if oboConfig := s.getPluginConfig("aquadoor-obo"); oboConfig != nil && oboConfig.Enabled {
+		if cfg, _ := MarshalPluginConfig[aquadoorobo.Config](oboConfig.Config); cfg != nil && cfg.Issuer != "" {
+			s.registerPluginWithStatus(ctx, "aquadoor-obo", nil, oboConfig.Config, false)
+		} else {
+			s.markPluginDisabled("aquadoor-obo")
+			logger.Warn("aquadoor-obo enabled but no Issuer — OBO is OFF (set AQUADOOR_OBO_ISSUER); MUST be configured before runner MCP calls")
+		}
 	} else {
 		s.markPluginDisabled("aquadoor-obo")
 	}
