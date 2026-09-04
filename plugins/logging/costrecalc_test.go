@@ -473,3 +473,59 @@ func TestRunCostRecalcJob_HydratesInBoundedChunks(t *testing.T) {
 		t.Fatalf("chunks covered %d rows, want every one of %d: %v", total, rows, store.hydrateChunkSizes)
 	}
 }
+
+// A job kind reprices an aggregate row to a single scalar total and leaves
+// breakdown nil; the generic path is the other way round. persistRecalcOutcomes
+// reading the nil breakdown for a kind-owned outcome wrote CostUpdate{} — zeros —
+// over a real provider-reported cost, and still counted the row as priced. This
+// exercises the seam end to end rather than what RepriceFromLog returns, which is
+// where that bug hid.
+func TestPersistRecalcOutcomes_KindOwnedCostSurvivesPersistence(t *testing.T) {
+	const id = "runware-settlement"
+	store := newFakeRecalcStore([]logstore.Log{{ID: id}})
+	plugin := newRecalcPlugin(t, store)
+
+	// What VideoSettler.RepriceFromLog returns for a provider-reported cost: a
+	// positive total, and no debug blob to write alongside it.
+	outcomes := []billingOutcome{{cost: 0.42, kindOwned: true}}
+
+	tally, err := plugin.persistRecalcOutcomes(context.Background(), []logstore.Log{{ID: id}}, outcomes)
+	if err != nil {
+		t.Fatalf("persistRecalcOutcomes: %v", err)
+	}
+	if got := store.cost[id]; got != 0.42 {
+		t.Errorf("provider cost did not survive the reprice: got %v, want 0.42", got)
+	}
+	if got := store.split[id].Total; got != 0.42 {
+		t.Errorf("split total = %v, want 0.42", got)
+	}
+	if !tally.priced[0] {
+		t.Error("a repriced row must count as priced")
+	}
+}
+
+// The generic path carries a per-category split. Resolving both paths through one
+// helper must not flatten it into a bare total.
+func TestPersistRecalcOutcomes_GenericBreakdownKeepsItsSplit(t *testing.T) {
+	const id = "chat-row"
+	store := newFakeRecalcStore([]logstore.Log{{ID: id}})
+	plugin := newRecalcPlugin(t, store)
+
+	outcomes := []billingOutcome{{
+		cost:      0.30,
+		breakdown: &schemas.BifrostCost{InputCost: 0.10, OutputCost: 0.20, TotalCost: 0.30},
+	}}
+
+	tally, err := plugin.persistRecalcOutcomes(context.Background(), []logstore.Log{{ID: id}}, outcomes)
+	if err != nil {
+		t.Fatalf("persistRecalcOutcomes: %v", err)
+	}
+	got := store.split[id]
+	if got.Total != 0.30 || got.Input != 0.10 || got.Output != 0.20 {
+		t.Errorf("the split collapsed: got total=%v input=%v output=%v, want 0.30/0.10/0.20",
+			got.Total, got.Input, got.Output)
+	}
+	if !tally.priced[0] {
+		t.Error("a repriced row must count as priced")
+	}
+}
