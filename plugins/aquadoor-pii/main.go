@@ -61,11 +61,29 @@ func (p *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostReq
 // PreLLMHook redacts every outbound text span, or blocks (fail-closed) on any Presidio anomaly
 // or a configured BLOCK entity.
 func (p *Plugin) PreLLMHook(
-	_ *schemas.BifrostContext,
+	bctx *schemas.BifrostContext,
 	req *schemas.BifrostRequest,
 ) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
 	if req == nil {
 		return req, nil, nil
+	}
+	// Fail-closed #1 — raw request-body passthrough: the ORIGINAL client bytes egress (the
+	// parsed-request span mutation below never touches them), so this text guardrail cannot redact
+	// the request. Block it. Set by the Anthropic/Gemini native passthrough integrations (#1780 review).
+	if bctx != nil {
+		if raw, ok := bctx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool); ok && raw {
+			return req, blockShortCircuit("pii_raw_passthrough_unredactable",
+				"raw request-body passthrough egresses un-redacted bytes; blocked (fail-closed)"), nil
+		}
+	}
+	// Fail-closed #2 — a prompt/content-bearing request shape this guardrail does not redact. Chat,
+	// text-completion, embedding (RAG) and image-generation ARE covered by collectTextSpans below;
+	// every other content-bearing shape would otherwise egress un-redacted (silent fail-OPEN, #1780
+	// review). Block it loudly rather than leak. Extend collectTextSpans + unsupportedShape together
+	// as B7 adds coverage.
+	if shape := unsupportedShape(req); shape != "" {
+		return req, blockShortCircuit("pii_unsupported_shape",
+			"PII guardrail cannot redact a "+shape+" request; blocked (fail-closed)"), nil
 	}
 	for _, span := range collectTextSpans(req) {
 		text := span.get()
@@ -121,6 +139,39 @@ func blockShortCircuit(code, msg string) *schemas.LLMPluginShortCircuit {
 	}
 }
 
+// unsupportedShape names a prompt/content-bearing request shape this guardrail does NOT redact (so
+// PreLLMHook must fail closed), or "" when the request is either fully covered by collectTextSpans
+// (chat, text-completion, embedding, image-generation) or is a content-free operational request
+// (list-models, responses retrieve/delete/cancel/input-items, video retrieve/download, image
+// variation) that egresses no user PII text. The blocked shapes carry user text/content off-shore
+// that this text guardrail cannot yet inspect — a loud block is the fail-closed choice over a
+// silent leak. Extend collectTextSpans + this switch together as B7 adds coverage.
+func unsupportedShape(req *schemas.BifrostRequest) string {
+	switch {
+	case req.ResponsesRequest != nil:
+		return "responses"
+	case req.CountTokensRequest != nil:
+		return "count-tokens"
+	case req.RerankRequest != nil:
+		return "rerank"
+	case req.SpeechRequest != nil:
+		return "speech"
+	case req.TranscriptionRequest != nil:
+		return "transcription"
+	case req.ImageEditRequest != nil:
+		return "image-edit"
+	case req.VideoGenerationRequest != nil:
+		return "video-generation"
+	case req.VideoEditRequest != nil:
+		return "video-edit"
+	case req.OCRRequest != nil:
+		return "ocr"
+	case req.CompactionRequest != nil:
+		return "compaction"
+	}
+	return ""
+}
+
 // textSpan is a mutable handle to one outbound text field.
 type textSpan struct {
 	get func() string
@@ -163,6 +214,27 @@ func collectTextSpans(req *schemas.BifrostRequest) []textSpan {
 				set: func(s string) { in.PromptArray[idx] = s },
 			})
 		}
+	}
+	// Embedding (the RAG path — user documents/queries embedded off-shore; MUST be redacted, never
+	// blocked): Text (single) + Texts (batch).
+	if req.EmbeddingRequest != nil && req.EmbeddingRequest.Input != nil {
+		in := req.EmbeddingRequest.Input
+		if in.Text != nil {
+			et := in.Text
+			spans = append(spans, textSpan{get: func() string { return *et }, set: func(s string) { *et = s }})
+		}
+		for k := range in.Texts {
+			idx := k
+			spans = append(spans, textSpan{
+				get: func() string { return in.Texts[idx] },
+				set: func(s string) { in.Texts[idx] = s },
+			})
+		}
+	}
+	// Image generation (the image prompt — a text description that can carry PII; redact it).
+	if req.ImageGenerationRequest != nil && req.ImageGenerationRequest.Input != nil {
+		gi := req.ImageGenerationRequest.Input
+		spans = append(spans, textSpan{get: func() string { return gi.Prompt }, set: func(s string) { gi.Prompt = s }})
 	}
 	return spans
 }

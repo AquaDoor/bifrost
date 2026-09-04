@@ -300,7 +300,22 @@ func (m *ToolsManager) GetAvailableTools(ctx *schemas.BifrostContext) []schemas.
 // rekeyFederatedToolsToBare rewrites federated (client-prefixed) tool names to their unique bare
 // name and drops ambiguous ones. See aquadoor_barenames.go for the bijection + fail-closed guard.
 func (m *ToolsManager) rekeyFederatedToolsToBare(tools []schemas.ChatTool, perClient map[string][]schemas.ChatTool) []schemas.ChatTool {
-	bareOk, ambiguous := PartitionBareToolNames(collectPrefixedTools(perClient))
+	// The ambiguity universe MUST match the advertised surface. Code-mode client tools are excluded
+	// from availableTools (they are reached via the code-mode meta-tool, never served bare), yet
+	// GetToolPerClient still returns them in perClient — so they must NOT participate in the
+	// bare-name collision check. Otherwise a code-mode client sharing a bare name with a regular
+	// federated client would poison the bijection: the name reads as ambiguous and the legitimate,
+	// uniquely-advertisable regular tool is dropped on a collision invisible to the surface (#1780
+	// review). Filter code-mode clients out before partitioning.
+	advertisedPerClient := make(map[string][]schemas.ChatTool, len(perClient))
+	for clientName, cts := range perClient {
+		if client := m.clientManager.GetClientByName(clientName); client != nil && client.ExecutionConfig.IsCodeModeClient {
+			continue
+		}
+		advertisedPerClient[clientName] = cts
+	}
+	prefixedUniverse := collectPrefixedTools(advertisedPerClient)
+	bareOk, ambiguous := PartitionBareToolNames(prefixedUniverse)
 	if len(ambiguous) > 0 {
 		m.logger.Warn("%s excluded %d ambiguous bare tool name(s) (claimed by >=2 clients): %v", MCPLogPrefix, len(ambiguous), ambiguous)
 	}
@@ -309,7 +324,7 @@ func (m *ToolsManager) rekeyFederatedToolsToBare(tools []schemas.ChatTool, perCl
 		prefixedToBare[bt.PrefixedName] = bt.BareName
 	}
 	federated := make(map[string]bool)
-	for _, pt := range collectPrefixedTools(perClient) {
+	for _, pt := range prefixedUniverse {
 		federated[pt.PrefixedName] = true
 	}
 	rekeyed := make([]schemas.ChatTool, 0, len(tools))

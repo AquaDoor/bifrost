@@ -39,7 +39,7 @@ func injectedAuth(ctx *schemas.BifrostContext) string {
 func TestOboPlugin_InjectsTokenForRunnerClient(t *testing.T) {
 	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
 	svc := testService(t, m, StrategyImpersonation)
-	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"})
+	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
 
 	ctx := mkCtx("sk-bf-user")
 	req := &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner"}
@@ -61,7 +61,7 @@ func TestOboPlugin_InjectsTokenForRunnerClient(t *testing.T) {
 func TestOboPlugin_IgnoresNonRunnerClient(t *testing.T) {
 	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
 	svc := testService(t, m, StrategyImpersonation)
-	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"})
+	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
 
 	ctx := mkCtx("sk-bf-user")
 	_, sc, err := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "outline"})
@@ -76,7 +76,7 @@ func TestOboPlugin_IgnoresNonRunnerClient(t *testing.T) {
 func TestOboPlugin_FailsClosedWithoutVK(t *testing.T) {
 	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
 	svc := testService(t, m, StrategyImpersonation)
-	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"})
+	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
 
 	ctx := mkCtx("") // no virtual key
 	_, sc, _ := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner"})
@@ -88,7 +88,7 @@ func TestOboPlugin_FailsClosedWithoutVK(t *testing.T) {
 func TestOboPlugin_FailsClosedOnUnresolvedUser(t *testing.T) {
 	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
 	svc := testService(t, m, StrategyImpersonation)
-	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "", err: context.DeadlineExceeded})
+	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "", err: context.DeadlineExceeded}, nil)
 
 	ctx := mkCtx("sk-bf-user")
 	_, sc, _ := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner"})

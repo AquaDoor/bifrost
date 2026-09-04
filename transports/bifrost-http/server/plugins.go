@@ -196,7 +196,7 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 			timeout = 10 * time.Second
 		}
 		svc := aquadoorobo.NewService(*cfg, &http.Client{Timeout: timeout})
-		return aquadoorobo.NewPlugin(svc, cfg.RunnerClients, aquadoorobo.GovernanceVKNameResolver{}), nil
+		return aquadoorobo.NewPlugin(svc, cfg.RunnerClients, aquadoorobo.GovernanceVKNameResolver{}, logger), nil
 
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)

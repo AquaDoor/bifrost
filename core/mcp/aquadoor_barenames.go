@@ -93,13 +93,19 @@ func collectPrefixedTools(perClient map[string][]schemas.ChatTool) []PrefixedToo
 }
 
 // setRequestToolName rewrites the tool-call name on a BifrostMCPRequest (the writable dual of
-// GetToolName). The request is built per tools/call, so mutating its *string name field is safe
-// (no shared cache). Used on the execute path to swap a bare name for its unique prefixed exec name.
+// GetToolName) by pointing its name field at a FRESH string. The name *string is aliased into the
+// model response's recorded tool calls (ChatAssistantMessage.ToolCalls copy the struct by value,
+// sharing the *string), so an in-place `*Name = name` would leak the prefixed exec name back into
+// the agent-visible response + conversation history — defeating bare-name serving. Reassigning a
+// new pointer retargets ONLY this per-call request copy, leaving the shared response string bare.
+// Used on the execute path to swap a bare name for its unique prefixed exec name.
 func setRequestToolName(r *schemas.BifrostMCPRequest, name string) {
-	if r.ChatAssistantMessageToolCall != nil && r.ChatAssistantMessageToolCall.Function.Name != nil {
-		*r.ChatAssistantMessageToolCall.Function.Name = name
+	if r.ChatAssistantMessageToolCall != nil {
+		n := name
+		r.ChatAssistantMessageToolCall.Function.Name = &n
 	}
-	if r.ResponsesToolMessage != nil && r.ResponsesToolMessage.Name != nil {
-		*r.ResponsesToolMessage.Name = name
+	if r.ResponsesToolMessage != nil {
+		n := name
+		r.ResponsesToolMessage.Name = &n
 	}
 }

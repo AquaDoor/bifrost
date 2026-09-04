@@ -28,20 +28,22 @@ type OboPlugin struct {
 	svc           *Service
 	runnerClients map[string]bool
 	resolver      EmailResolver
+	logger        schemas.Logger // may be nil (the per-mint audit line is then skipped)
 }
 
 var _ schemas.MCPPlugin = (*OboPlugin)(nil)
 
 // NewPlugin builds the adapter. runnerClients are the Bifrost MCP client names that federate the
-// AquaDoor runners (only these get an OBO token; Outline/etc. keep their own static auth).
-func NewPlugin(svc *Service, runnerClients []string, resolver EmailResolver) *OboPlugin {
+// AquaDoor runners (only these get an OBO token; Outline/etc. keep their own static auth). logger
+// may be nil (the per-mint audit line — spec #1780 §7.8 — is then skipped).
+func NewPlugin(svc *Service, runnerClients []string, resolver EmailResolver, logger schemas.Logger) *OboPlugin {
 	set := make(map[string]bool, len(runnerClients))
 	for _, c := range runnerClients {
 		if c != "" {
 			set[c] = true
 		}
 	}
-	return &OboPlugin{svc: svc, runnerClients: set, resolver: resolver}
+	return &OboPlugin{svc: svc, runnerClients: set, resolver: resolver, logger: logger}
 }
 
 func (p *OboPlugin) GetName() string { return "aquadoor-obo" }
@@ -62,11 +64,17 @@ func (p *OboPlugin) PreMCPHook(
 	if err != nil || email == "" {
 		return req, blockMCP("obo_no_identity", "cannot resolve the acting user for OBO"), nil
 	}
-	token, _, err := p.svc.GetRunnerToken(ctx, email, "")
+	token, audit, err := p.svc.GetRunnerToken(ctx, email, "")
 	if err != nil {
 		return req, blockMCP("obo_mint_failed", "OBO token mint failed: "+err.Error()), nil
 	}
 	injectMCPHeader(ctx, "Authorization", "Bearer "+token)
+	// Audit line (spec #1780 §7.8): one record per runner-token mint, so an OBO grant is traceable
+	// to the acting user + resolved Zitadel id (never the spoofable header path #1777 replaced).
+	if p.logger != nil {
+		p.logger.Info("[aquadoor-obo] runner token minted: client=%s email=%s userId=%s strategy=%s cacheHit=%v",
+			req.ClientName, audit.Email, audit.UserID, audit.Strategy, audit.CacheHit)
+	}
 	return req, nil, nil
 }
 

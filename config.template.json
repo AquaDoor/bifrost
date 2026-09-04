@@ -53,7 +53,7 @@
         "UpstreamClientID": "${AQUADOOR_OBO_UPSTREAM_CLIENT_ID}",
         "RunnerToolPrefixes": ["aquadoor-runner-"],
         "RunnerClients": ${AQUADOOR_OBO_RUNNER_CLIENTS},
-        "Strategy": "delegation"
+        "Strategy": "impersonation"
       }
     }
   ]
