@@ -31,7 +31,10 @@ type OboPlugin struct {
 	logger        schemas.Logger // may be nil (the per-mint audit line is then skipped)
 }
 
-var _ schemas.MCPPlugin = (*OboPlugin)(nil)
+var (
+	_ schemas.MCPPlugin           = (*OboPlugin)(nil)
+	_ schemas.MCPConnectionPlugin = (*OboPlugin)(nil)
+)
 
 // NewPlugin builds the adapter. runnerClients are the Bifrost MCP client names that federate the
 // AquaDoor runners (only these get an OBO token; Outline/etc. keep their own static auth). logger
@@ -86,6 +89,46 @@ func (p *OboPlugin) PostMCPHook(
 	return resp, bifrostErr, nil
 }
 
+// PreMCPConnectionHook injects a machine ACTOR token (scoped to the runner audience) as the
+// Authorization header on the runner MCP CONNECTION, so Bifrost can discover the runner's tool
+// catalog — the runner's tools/list serves the full catalog to any authenticated caller; per-user
+// enforcement happens on tools/call (PreMCPHook injects the user OBO token). Non-runner clients keep
+// their own connection auth. Runner clients MUST be configured auth_type:"none" so the credStore
+// does not override this header. If RunnerAudience is unset the hook injects nothing (federation
+// self-disabled, like the rest of OBO); a mint FAILURE fails closed (the connection is refused, so
+// the runner is never federated with a bad/absent token) — a degraded surface, never a wrong one.
+func (p *OboPlugin) PreMCPConnectionHook(
+	ctx *schemas.BifrostContext,
+	req *schemas.BifrostMCPConnectRequest,
+) (*schemas.BifrostMCPConnectRequest, *schemas.MCPConnectionShortCircuit, error) {
+	if req == nil || !p.runnerClients[req.ClientName] {
+		return req, nil, nil // not a runner client → its own connection auth applies
+	}
+	token, err := p.svc.GetRunnerConnectionToken(ctx)
+	if err != nil {
+		return req, blockMCPConnection("obo_conn_mint_failed", "runner connection token mint failed: "+err.Error()), nil
+	}
+	if token == "" {
+		return req, nil, nil // RunnerAudience unset → federation self-disabled (leave the connection be)
+	}
+	if req.Headers == nil {
+		req.Headers = map[string]string{}
+	}
+	req.Headers["Authorization"] = "Bearer " + token
+	if p.logger != nil {
+		p.logger.Info("[aquadoor-obo] runner connection token injected for discovery: client=%s", req.ClientName)
+	}
+	return req, nil, nil
+}
+
+func (p *OboPlugin) PostMCPConnectionHook(
+	_ *schemas.BifrostContext,
+	resp *schemas.BifrostMCPConnectResponse,
+	bifrostErr *schemas.BifrostError,
+) (*schemas.BifrostMCPConnectResponse, *schemas.BifrostError, error) {
+	return resp, bifrostErr, nil
+}
+
 // injectMCPHeader merges one header into BifrostContextKeyMCPExtraHeaders (forwarded to the MCP
 // server iff allowlisted by the client's AllowedExtraHeaders).
 func injectMCPHeader(ctx *schemas.BifrostContext, key, value string) {
@@ -101,6 +144,19 @@ func injectMCPHeader(ctx *schemas.BifrostContext, key, value string) {
 
 func blockMCP(code, msg string) *schemas.MCPPluginShortCircuit {
 	return &schemas.MCPPluginShortCircuit{
+		Error: &schemas.BifrostError{
+			StatusCode: schemas.Ptr(403),
+			Error: &schemas.ErrorField{
+				Type:    schemas.Ptr("obo_guardrail"),
+				Code:    schemas.Ptr(code),
+				Message: msg,
+			},
+		},
+	}
+}
+
+func blockMCPConnection(code, msg string) *schemas.MCPConnectionShortCircuit {
+	return &schemas.MCPConnectionShortCircuit{
 		Error: &schemas.BifrostError{
 			StatusCode: schemas.Ptr(403),
 			Error: &schemas.ErrorField{

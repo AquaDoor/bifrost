@@ -62,6 +62,11 @@ type Config struct {
 	// NewPlugin as the runner-client allow-set.
 	RunnerClients  []string
 	Strategy       string
+	// RunnerAudience is the runner's MCP-caps project id — the `aud` of the machine ACTOR token
+	// Bifrost presents on the runner MCP CONNECTION for tool discovery (tools/list serves any
+	// authenticated caller; per-user enforcement is on tools/call via the OBO-injected user token).
+	// Empty → the connection hook injects nothing (federation self-disabled, like the other OBO env).
+	RunnerAudience string
 	TokenSkew      time.Duration
 	UserIDCacheTTL time.Duration
 	HTTPTimeout    time.Duration
@@ -73,6 +78,12 @@ func (c *Config) UserSearchURL() string {
 }
 func (c *Config) BackendAudScope() string {
 	return fmt.Sprintf("urn:zitadel:iam:org:project:id:%s:aud", c.BackendProjectID)
+}
+
+// RunnerAudScope is the Zitadel project-audience reservation scope for the runner's MCP-caps
+// project — mints an actor token whose `aud` the runner's verifyJwt accepts for connection discovery.
+func (c *Config) RunnerAudScope() string {
+	return fmt.Sprintf("urn:zitadel:iam:org:project:id:%s:aud", c.RunnerAudience)
 }
 
 // IsRunnerTool reports whether name (the federated tool name) is a first-party runner tool that

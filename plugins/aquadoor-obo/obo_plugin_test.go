@@ -85,6 +85,61 @@ func TestOboPlugin_FailsClosedWithoutVK(t *testing.T) {
 	}
 }
 
+func connSvc(t *testing.T, m *mockZitadel, runnerAud string) *Service {
+	t.Helper()
+	return NewService(Config{
+		Issuer:         m.srv.URL,
+		ActorKey:       testActorKey(t),
+		RunnerAudience: runnerAud,
+		Strategy:       StrategyImpersonation,
+	}, m.srv.Client())
+}
+
+func TestOboPlugin_ConnectionInjectsRunnerToken(t *testing.T) {
+	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
+	p := NewPlugin(connSvc(t, m, "runner-proj"), []string{"aquadoor-runner-catalog"}, mockResolver{email: "u@aquadoor.dev"}, nil)
+
+	req := &schemas.BifrostMCPConnectRequest{ClientName: "aquadoor-runner-catalog"}
+	out, sc, err := p.PreMCPConnectionHook(mkCtx(""), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc != nil {
+		t.Fatalf("unexpected short-circuit: %+v", sc.Error)
+	}
+	if out.Headers["Authorization"] != "Bearer actor-token" {
+		t.Errorf("connection discovery token not injected: %q", out.Headers["Authorization"])
+	}
+}
+
+func TestOboPlugin_ConnectionSkipsNonRunnerClient(t *testing.T) {
+	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
+	p := NewPlugin(connSvc(t, m, "runner-proj"), []string{"aquadoor-runner-catalog"}, mockResolver{email: "u@aquadoor.dev"}, nil)
+
+	out, sc, err := p.PreMCPConnectionHook(mkCtx(""), &schemas.BifrostMCPConnectRequest{ClientName: "outline"})
+	if err != nil || sc != nil {
+		t.Fatalf("non-runner client must pass through: sc=%v err=%v", sc, err)
+	}
+	if out.Headers["Authorization"] != "" {
+		t.Error("must NOT inject a discovery token for a non-runner client")
+	}
+}
+
+func TestOboPlugin_ConnectionNoopWhenAudienceUnset(t *testing.T) {
+	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
+	// RunnerAudience "" → federation self-disabled: the hook injects nothing (no token minted).
+	p := NewPlugin(connSvc(t, m, ""), []string{"aquadoor-runner-catalog"}, mockResolver{email: "u@aquadoor.dev"}, nil)
+
+	req := &schemas.BifrostMCPConnectRequest{ClientName: "aquadoor-runner-catalog"}
+	out, sc, err := p.PreMCPConnectionHook(mkCtx(""), req)
+	if err != nil || sc != nil {
+		t.Fatalf("unset audience must be a no-op pass-through: sc=%v err=%v", sc, err)
+	}
+	if out.Headers["Authorization"] != "" {
+		t.Error("must NOT inject a discovery token when RunnerAudience is unset")
+	}
+}
+
 func TestOboPlugin_FailsClosedOnUnresolvedUser(t *testing.T) {
 	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
 	svc := testService(t, m, StrategyImpersonation)

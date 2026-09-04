@@ -33,17 +33,20 @@ type Service struct {
 	subjectProvider SubjectTokenProvider
 	now             func() time.Time
 
-	mu            sync.Mutex // guards the caches + emailLocks map (short critical sections only)
-	actorToken    string
-	actorExpiry   time.Time
-	mgmtToken     string
-	mgmtExpiry    time.Time
-	userIDCache   map[string]cacheEntry
-	exchangeCache map[string]cacheEntry
-	emailLocks    map[string]*sync.Mutex
+	mu               sync.Mutex // guards the caches + emailLocks map (short critical sections only)
+	actorToken       string
+	actorExpiry      time.Time
+	mgmtToken        string
+	mgmtExpiry       time.Time
+	runnerConnToken  string    // cached actor token scoped to the runner audience (connection discovery)
+	runnerConnExpiry time.Time //
+	userIDCache      map[string]cacheEntry
+	exchangeCache    map[string]cacheEntry
+	emailLocks       map[string]*sync.Mutex
 
-	actorMu sync.Mutex // serialize actor-token minting across the HTTP call
-	mgmtMu  sync.Mutex // serialize mgmt-token minting
+	actorMu      sync.Mutex // serialize actor-token minting across the HTTP call
+	mgmtMu       sync.Mutex // serialize mgmt-token minting
+	runnerConnMu sync.Mutex // serialize runner-connection-token minting
 }
 
 type ServiceOption func(*Service)
@@ -179,6 +182,31 @@ func (s *Service) getActorToken(ctx context.Context) (string, error) {
 
 func (s *Service) getMgmtToken(ctx context.Context) (string, error) {
 	return s.getActorTokenScoped(ctx, true, "openid "+mgmtAudScope, &s.mgmtMu)
+}
+
+// GetRunnerConnectionToken mints (cached) an ACTOR access token scoped to the runner's MCP-caps
+// audience — the machine token Bifrost presents on the runner MCP CONNECTION so it can discover the
+// tool catalog (tools/list serves any authenticated caller; per-user enforcement is on tools/call
+// via the OBO-injected user token). azp = the actor client (∈ the runner's allowedClientIds), aud =
+// the runner project, so verifyJwt accepts it. Empty RunnerAudience → returns "" (caller skips
+// injection; federation self-disabled). Serialized on its own mutex + short-lived cached.
+func (s *Service) GetRunnerConnectionToken(ctx context.Context) (string, error) {
+	if s.cfg.RunnerAudience == "" {
+		return "", nil
+	}
+	s.runnerConnMu.Lock()
+	defer s.runnerConnMu.Unlock()
+	now := s.now()
+	if s.runnerConnToken != "" && now.Before(s.runnerConnExpiry.Add(-s.cfg.TokenSkew)) {
+		return s.runnerConnToken, nil
+	}
+	tok, err := s.mintActor(ctx, "openid "+s.cfg.RunnerAudScope())
+	if err != nil {
+		return "", err
+	}
+	s.runnerConnToken = tok
+	s.runnerConnExpiry = tokenLifetimeExpiry(tok, now, 10*time.Minute)
+	return s.runnerConnToken, nil
 }
 
 func (s *Service) resolveUserID(ctx context.Context, email string) (string, error) {
