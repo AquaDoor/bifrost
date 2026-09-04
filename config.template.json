@@ -1,0 +1,70 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": {
+    "drop_excess_requests": false
+  },
+  "providers": {
+    "aquadoor-llm": {
+      "keys": [
+        { "name": "aquadoor-llm-key", "value": "env.AQUADOOR_LLM_API_KEY", "models": ["*"], "weight": 1.0 }
+      ],
+      "network_config": { "base_url": "${AQUADOOR_LLM_BASE_URL}" },
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "chat_completion": true,
+          "chat_completion_stream": true,
+          "embedding": true,
+          "image_generation": true
+        }
+      }
+    }
+  },
+  "mcp": {
+    "client_configs": [
+      {
+        "name": "aquadoor-runner",
+        "connection_type": "http",
+        "connection_string": "env.AQUADOOR_RUNNER_MCP_URL",
+        "auth_type": "headers",
+        "headers": { "Authorization": "env.AQUADOOR_RUNNER_BOOTSTRAP_TOKEN" },
+        "allowed_extra_headers": ["Authorization"],
+        "tools_to_execute": ["*"]
+      }
+    ]
+  },
+  "governance": {
+    "auth_config": {
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD",
+      "is_enabled": true
+    },
+    "virtual_keys": []
+  },
+  "plugins": [
+    { "name": "governance", "enabled": true, "config": { "is_vk_mandatory": true } },
+    {
+      "name": "aquadoor-pii",
+      "enabled": true,
+      "config": {
+        "AnalyzerURL": "${AQUADOOR_PRESIDIO_ANALYZER_URL}",
+        "AnonymizerURL": "${AQUADOOR_PRESIDIO_ANONYMIZER_URL}",
+        "Language": "ru",
+        "TimeoutMS": 5000,
+        "BlockEntities": { "RU_INN": true, "RU_OGRN": true, "RU_OGRNIP": true, "RU_PASSPORT": true }
+      }
+    },
+    {
+      "name": "aquadoor-obo",
+      "enabled": true,
+      "config": {
+        "Issuer": "${AQUADOOR_OBO_ISSUER}",
+        "BackendProjectID": "${AQUADOOR_OBO_BACKEND_PROJECT_ID}",
+        "UpstreamClientID": "${AQUADOOR_OBO_UPSTREAM_CLIENT_ID}",
+        "RunnerToolPrefixes": ["aquadoor-runner-"],
+        "RunnerClients": ["aquadoor-runner"],
+        "Strategy": "delegation"
+      }
+    }
+  ]
+}
