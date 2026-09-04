@@ -2,11 +2,17 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"os"
 	"slices"
+	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	aquadoorobo "github.com/maximhq/bifrost/plugins/aquadoor-obo"
+	aquadoorpii "github.com/maximhq/bifrost/plugins/aquadoor-pii"
 	"github.com/maximhq/bifrost/plugins/compat"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/logging"
@@ -149,6 +155,48 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 
 	case modelcatalogresolver.PluginName:
 		return modelcatalogresolver.Init(bifrostConfig.ModelCatalog, logger)
+
+	case "aquadoor-pii":
+		// AquaDoor fail-closed Presidio PII egress guardrail (#1780 §7.5). Fully config-driven
+		// (analyzer/anonymizer URLs, language, entities); no secrets, no runtime deps.
+		cfg, err := MarshalPluginConfig[aquadoorpii.Config](pluginConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal aquadoor-pii plugin config: %w", err)
+		}
+		if cfg == nil {
+			cfg = &aquadoorpii.Config{}
+		}
+		return aquadoorpii.New(*cfg), nil
+
+	case "aquadoor-obo":
+		// AquaDoor verified-identity OBO on runner MCP calls (#1780 §7.2, #1777). Non-secret config
+		// (issuer, project id, client id, runner clients/prefixes, strategy) comes from config.json;
+		// the two SECRETS — the Zitadel MachineKey (actor key JSON) and the upstream client secret —
+		// come from env, never config.json. The email is resolved from the governance-verified VK
+		// name in context (GovernanceVKNameResolver), so OBO must run AFTER governance.
+		cfg, err := MarshalPluginConfig[aquadoorobo.Config](pluginConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal aquadoor-obo plugin config: %w", err)
+		}
+		if cfg == nil {
+			cfg = &aquadoorobo.Config{}
+		}
+		if raw := os.Getenv("AQUADOOR_OBO_ACTOR_KEY_JSON"); raw != "" {
+			var ak aquadoorobo.ActorKey
+			if err := json.Unmarshal([]byte(raw), &ak); err != nil {
+				return nil, fmt.Errorf("aquadoor-obo: invalid AQUADOOR_OBO_ACTOR_KEY_JSON: %w", err)
+			}
+			cfg.ActorKey = ak
+		}
+		if s := os.Getenv("AQUADOOR_OBO_UPSTREAM_CLIENT_SECRET"); s != "" {
+			cfg.UpstreamClientSecret = s
+		}
+		timeout := cfg.HTTPTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		svc := aquadoorobo.NewService(*cfg, &http.Client{Timeout: timeout})
+		return aquadoorobo.NewPlugin(svc, cfg.RunnerClients, aquadoorobo.GovernanceVKNameResolver{}), nil
 
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
@@ -312,6 +360,27 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	// including post_builtin ones like the enterprise load balancer (which would otherwise run
 	// after this builtin and never get a chance to pick the provider first).
 	s.Config.SetPluginOrderInfo(modelcatalogresolver.PluginName, schemas.Ptr(schemas.PluginPlacementPostBuiltin), schemas.Ptr(math.MaxInt))
+
+	// 11. AquaDoor PII egress guardrail (#1780 §7.5). Config-driven (analyzer/anonymizer URLs).
+	// Runs late (after compat) so it redacts the fully-assembled request before egress. Its runtime
+	// fail-closed (Presidio error/timeout → block) lives in the plugin; this only gates registration.
+	piiConfig := s.getPluginConfig("aquadoor-pii")
+	if piiConfig != nil && piiConfig.Enabled {
+		s.registerPluginWithStatus(ctx, "aquadoor-pii", nil, piiConfig.Config, false)
+	} else {
+		s.markPluginDisabled("aquadoor-pii")
+	}
+	s.Config.SetPluginOrderInfo("aquadoor-pii", builtinPlacement, schemas.Ptr(10))
+
+	// 12. AquaDoor OBO (#1780 §7.2). MUST run after governance (order 4) so the VK name (= user
+	// email) is stamped in context before GovernanceVKNameResolver reads it. Config-driven.
+	oboConfig := s.getPluginConfig("aquadoor-obo")
+	if oboConfig != nil && oboConfig.Enabled {
+		s.registerPluginWithStatus(ctx, "aquadoor-obo", nil, oboConfig.Config, false)
+	} else {
+		s.markPluginDisabled("aquadoor-obo")
+	}
+	s.Config.SetPluginOrderInfo("aquadoor-obo", builtinPlacement, schemas.Ptr(11))
 
 	return nil
 }

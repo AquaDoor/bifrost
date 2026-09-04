@@ -57,10 +57,14 @@ type Config struct {
 	UpstreamClientID     string
 	UpstreamClientSecret string
 	RunnerToolPrefixes   []string
-	Strategy             string
-	TokenSkew            time.Duration
-	UserIDCacheTTL       time.Duration
-	HTTPTimeout          time.Duration
+	// RunnerClients are the Bifrost MCP client names that federate the AquaDoor runners — only MCP
+	// calls to these clients get an OBO token (Outline/etc. keep their own static auth). Passed to
+	// NewPlugin as the runner-client allow-set.
+	RunnerClients  []string
+	Strategy       string
+	TokenSkew      time.Duration
+	UserIDCacheTTL time.Duration
+	HTTPTimeout    time.Duration
 }
 
 func (c *Config) TokenURL() string      { return strings.TrimRight(c.Issuer, "/") + "/oauth/v2/token" }

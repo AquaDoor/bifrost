@@ -17,6 +17,8 @@ require (
 	github.com/mark3labs/mcp-go v0.43.2
 	github.com/maximhq/bifrost/core v1.8.3
 	github.com/maximhq/bifrost/framework v1.6.0
+	github.com/maximhq/bifrost/plugins/aquadoor-obo v0.0.0
+	github.com/maximhq/bifrost/plugins/aquadoor-pii v0.0.0
 	github.com/maximhq/bifrost/plugins/compat v0.2.0
 	github.com/maximhq/bifrost/plugins/governance v1.7.0
 	github.com/maximhq/bifrost/plugins/logging v1.7.0
@@ -242,3 +244,10 @@ require (
 )
 
 replace github.com/valyala/fasthttp => github.com/maximhq/fasthttp v1.73.1
+
+// AquaDoor in-tree plugins (#1780) are local-only modules (no published version). Local-path
+// replaces make them resolvable in module mode too; the go.work also `use`s them for the workspace
+// build. Both point at the same source dirs (copied into the fork image before build).
+replace github.com/maximhq/bifrost/plugins/aquadoor-obo => ../plugins/aquadoor-obo
+
+replace github.com/maximhq/bifrost/plugins/aquadoor-pii => ../plugins/aquadoor-pii
