@@ -71,6 +71,19 @@ func (m *MCPManager) executeToolWithHooks(
 		}
 	}
 
+	// AquaDoor #1780 §7.4: agents call tools by their BARE name (advertised by GetAvailableTools);
+	// translate it back to the unique prefixed exec name BEFORE the ClientName derivation, the OBO
+	// PreMCPHook, and GetClientForTool so every downstream step routes on the real {client}-{tool}.
+	// A found=false result (unknown bare, or an ambiguous bare that the bijection excluded, or an
+	// already-prefixed name) passes through unchanged — an excluded name then fails closed at
+	// GetClientForTool (no client owns it), never a guessed dispatch.
+	if toolName := request.GetToolName(); toolName != "" {
+		bareOk, _ := PartitionBareToolNames(collectPrefixedTools(m.GetToolPerClient(ctx)))
+		if execName, found := ResolveBareToExecName(BareToPrefixed(bareOk), toolName); found && execName != toolName {
+			setRequestToolName(request, execName)
+		}
+	}
+
 	// Populate top-level ClientName from the prefixed tool name so the gate can
 	// attribute short-circuit responses without depending on prefix parsing.
 	if request.ClientName == "" {

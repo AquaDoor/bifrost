@@ -288,7 +288,49 @@ func (m *ToolsManager) GetAvailableTools(ctx *schemas.BifrostContext) []schemas.
 		}
 	}
 
-	return availableTools
+	// AquaDoor #1780 §7.4: serve federated MCP tools under their BARE original name (tender_lead,
+	// not aquadoor-runner-tender_lead) so archetype agents bind the runner's own tool name — the
+	// problem the ContextForge fork solved. Re-key each federated tool to bare via the bijection;
+	// a bare name claimed by >=2 clients is EXCLUDED (fail-closed, never guessed). Native/code-mode
+	// tools (absent from the federated set) pass through unchanged. Clone Function before renaming —
+	// the *ChatToolFunction is shared with the client cache and MUST NOT be mutated in place.
+	return m.rekeyFederatedToolsToBare(availableTools, availableToolsPerClient)
+}
+
+// rekeyFederatedToolsToBare rewrites federated (client-prefixed) tool names to their unique bare
+// name and drops ambiguous ones. See aquadoor_barenames.go for the bijection + fail-closed guard.
+func (m *ToolsManager) rekeyFederatedToolsToBare(tools []schemas.ChatTool, perClient map[string][]schemas.ChatTool) []schemas.ChatTool {
+	bareOk, ambiguous := PartitionBareToolNames(collectPrefixedTools(perClient))
+	if len(ambiguous) > 0 {
+		m.logger.Warn("%s excluded %d ambiguous bare tool name(s) (claimed by >=2 clients): %v", MCPLogPrefix, len(ambiguous), ambiguous)
+	}
+	prefixedToBare := make(map[string]string, len(bareOk))
+	for _, bt := range bareOk {
+		prefixedToBare[bt.PrefixedName] = bt.BareName
+	}
+	federated := make(map[string]bool)
+	for _, pt := range collectPrefixedTools(perClient) {
+		federated[pt.PrefixedName] = true
+	}
+	rekeyed := make([]schemas.ChatTool, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Function == nil {
+			rekeyed = append(rekeyed, tool)
+			continue
+		}
+		name := tool.Function.Name
+		if bare, ok := prefixedToBare[name]; ok {
+			fnCopy := *tool.Function // clone: the pointer is shared with the client cache
+			fnCopy.Name = bare
+			tool.Function = &fnCopy
+			rekeyed = append(rekeyed, tool)
+		} else if federated[name] {
+			continue // federated but ambiguous → excluded (fail-closed)
+		} else {
+			rekeyed = append(rekeyed, tool) // native / code-mode → unchanged
+		}
+	}
+	return rekeyed
 }
 
 // buildIntegrationDuplicateCheckMap builds a map of tool names to check for duplicates

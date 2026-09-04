@@ -1,6 +1,10 @@
 package mcp
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/maximhq/bifrost/core/schemas"
+)
 
 // AquaDoor bare-name serving (Bifrost unified gateway, #1780 §7.4).
 //
@@ -70,4 +74,32 @@ func BareToPrefixed(bareOk []BareTool) map[string]string {
 func ResolveBareToExecName(bareMap map[string]string, name string) (execName string, found bool) {
 	p, ok := bareMap[name]
 	return p, ok
+}
+
+// collectPrefixedTools flattens a GetToolPerClient result into the PrefixedTool set the bijection
+// consumes. It is the single source of the federated (client-prefixed) tool universe, used by both
+// the advertise path (GetAvailableTools) and the execute path (executeToolWithHooks) so the two
+// stay consistent.
+func collectPrefixedTools(perClient map[string][]schemas.ChatTool) []PrefixedTool {
+	var out []PrefixedTool
+	for clientName, tools := range perClient {
+		for _, t := range tools {
+			if t.Function != nil && t.Function.Name != "" {
+				out = append(out, PrefixedTool{PrefixedName: t.Function.Name, ClientName: clientName})
+			}
+		}
+	}
+	return out
+}
+
+// setRequestToolName rewrites the tool-call name on a BifrostMCPRequest (the writable dual of
+// GetToolName). The request is built per tools/call, so mutating its *string name field is safe
+// (no shared cache). Used on the execute path to swap a bare name for its unique prefixed exec name.
+func setRequestToolName(r *schemas.BifrostMCPRequest, name string) {
+	if r.ChatAssistantMessageToolCall != nil && r.ChatAssistantMessageToolCall.Function.Name != nil {
+		*r.ChatAssistantMessageToolCall.Function.Name = name
+	}
+	if r.ResponsesToolMessage != nil && r.ResponsesToolMessage.Name != nil {
+		*r.ResponsesToolMessage.Name = name
+	}
 }
