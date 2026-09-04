@@ -265,8 +265,23 @@ func stripChatUnverifiableReasoning(ctx *schemas.BifrostContext, req *schemas.Bi
 	rewritten := make([]schemas.ChatMessage, len(req.Input))
 	copy(rewritten, req.Input)
 
+	// Anthropic protects the latest assistant message's thinking blocks (see
+	// latestAssistantTurnStart). It is the last message with role assistant, not the last
+	// element: a tool-result round trip ends on tool messages.
+	protectedIndex := -1
+	if protectsLatestAssistantTurn(ctx, req.Model) {
+		for i := range rewritten {
+			if rewritten[i].Role == schemas.ChatMessageRoleAssistant {
+				protectedIndex = i
+			}
+		}
+	}
+
 	changed := false
 	for i := range rewritten {
+		if i == protectedIndex {
+			continue
+		}
 		assistant := rewritten[i].ChatAssistantMessage
 		if assistant == nil || len(assistant.ReasoningDetails) == 0 {
 			continue
@@ -319,6 +334,75 @@ func stripChatReasoningDetails(details []schemas.ChatReasoningDetails) ([]schema
 // strip gets a single retry, so healing one field per attempt would need two upstream
 // calls to reach a payload the upstream accepts.
 var contentBlockReasoningCarriers = []string{"signature", "encrypted_content"}
+
+// protectsLatestAssistantTurn reports whether the upstream this request is bound for
+// enforces Anthropic's rule that the latest assistant message's thinking blocks arrive
+// exactly as they were minted. Only that family does, and the rewrite has to be gated
+// on it: OpenAI has no such rule, and its refusal is routinely about a payload sitting
+// in the very last assistant turn, so protecting the turn there would disable the heal
+// this whole path exists for.
+//
+// Resolved through IsAnthropicModelFamily rather than the provider key, because the
+// family is what the rule follows: Claude is served from Anthropic, Bedrock and Vertex
+// alike, and every one of those enforces it.
+func protectsLatestAssistantTurn(ctx *schemas.BifrostContext, model string) bool {
+	return schemas.IsAnthropicModelFamily(ctx, model)
+}
+
+// isUserTurnItem reports whether a Responses item belongs to a user turn rather than
+// an assistant one. Used to find where the trailing assistant turn begins; anything
+// not listed here is assistant-side content.
+func isUserTurnItem(msg *schemas.ResponsesMessage) bool {
+	if msg.Type == nil {
+		// An item with no type is a plain message, which is user-side unless its role
+		// says otherwise.
+		return msg.Role == nil || *msg.Role != schemas.ResponsesInputMessageRoleAssistant
+	}
+	switch *msg.Type {
+	case schemas.ResponsesMessageTypeFunctionCallOutput,
+		schemas.ResponsesMessageTypeComputerCallOutput,
+		schemas.ResponsesMessageTypeLocalShellCallOutput,
+		schemas.ResponsesMessageTypeCustomToolCallOutput,
+		schemas.ResponsesMessageTypeMCPApprovalResponses:
+		return true
+	case schemas.ResponsesMessageTypeMessage:
+		return msg.Role == nil || *msg.Role != schemas.ResponsesInputMessageRoleAssistant
+	default:
+		return false
+	}
+}
+
+// latestAssistantTurnStart returns the index of the first item in the request's
+// trailing assistant turn, or len(input) when there is none.
+//
+// Anthropic protects exactly that turn: "Within the latest assistant message, the
+// sequence of consecutive thinking blocks must match what the model generated in the
+// original request: you can't rearrange, edit, or partially drop them. This includes
+// redacted_thinking blocks." Earlier turns carry no such rule.
+// https://platform.claude.com/docs/en/build-with-claude/thinking#preserving-thinking-blocks
+//
+// One assistant turn is spread across several Responses items -- a reasoning item, a
+// message, one function_call per tool -- and the egress converters group that
+// contiguous run back into a single Anthropic assistant message. The protected region
+// is therefore the whole run, not the last item.
+//
+// Trailing user-side items are skipped before the run is measured: a tool-result round
+// trip ends on function_call_output, which is exactly the shape Anthropic documents
+// this refusal against.
+func latestAssistantTurnStart(input []schemas.ResponsesMessage) int {
+	last := len(input) - 1
+	for last >= 0 && isUserTurnItem(&input[last]) {
+		last--
+	}
+	if last < 0 {
+		return len(input)
+	}
+	start := last
+	for start > 0 && !isUserTurnItem(&input[start-1]) {
+		start--
+	}
+	return start
+}
 
 // stripRawAnthropicChatThinking rewrites a buffered Anthropic Messages body so no
 // unverifiable thinking payload survives outside the one turn Anthropic protects,
@@ -510,10 +594,36 @@ func stripResponsesEncryptedContent(ctx *schemas.BifrostContext, req *schemas.Bi
 	}
 
 	input := *inputRef
+
+	// On an Anthropic-family upstream the trailing assistant turn is off limits: editing
+	// a signature there, or dropping the redacted_thinking item beside it, is the partial
+	// rewrite Anthropic refuses with "`thinking` or `redacted_thinking` blocks in the
+	// latest assistant message cannot be modified". Rewriting it spent the one retry to
+	// turn the signature refusal the strip was gated on into a second, more confusing 400
+	// -- which is what the client ended up seeing. The raw Anthropic chat rewrite already
+	// protected this turn; the typed shapes did not.
+	protectedFrom := len(input)
+	protectedModel := ""
+	switch {
+	case req.ResponsesRequest != nil:
+		protectedModel = req.ResponsesRequest.Model
+	case req.CountTokensRequest != nil:
+		protectedModel = req.CountTokensRequest.Model
+	case req.CompactionRequest != nil:
+		protectedModel = req.CompactionRequest.Model
+	}
+	if protectsLatestAssistantTurn(ctx, protectedModel) {
+		protectedFrom = latestAssistantTurnStart(input)
+	}
+
 	stripped := make([]schemas.ResponsesMessage, 0, len(input))
 	changed := false
 
-	for _, message := range input {
+	for index, message := range input {
+		if index >= protectedFrom {
+			stripped = append(stripped, message)
+			continue
+		}
 		messageChanged := false
 
 		if message.ResponsesReasoning != nil && message.ResponsesReasoning.EncryptedContent != nil {

@@ -241,6 +241,35 @@ func TestExecuteRequestWithRetries_HealsOnEveryProviderRejection(t *testing.T) {
 			req.ResponsesRequest.Provider = rejection.provider
 			req.ResponsesRequest.Model = rejection.model
 
+			// Anthropic protects the latest assistant turn, so a conversation whose only
+			// assistant turn is the unverifiable one has nothing the strip may legally
+			// rewrite. Give the Anthropic-family cases an earlier turn to heal and a
+			// protected one behind it, which is what a replayed agent loop looks like.
+			wantItems := 2
+			if protectsLatestAssistantTurn(nil, rejection.model) {
+				req.ResponsesRequest.Input = append(req.ResponsesRequest.Input,
+					schemas.ResponsesMessage{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						Status: schemas.Ptr("completed"),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("toolu_1"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesToolCallOutputStr: schemas.Ptr("done"),
+							},
+						},
+					},
+					schemas.ResponsesMessage{
+						ID:   schemas.Ptr("rs_latest"),
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
+						ResponsesReasoning: &schemas.ResponsesReasoning{
+							Summary:          []schemas.ResponsesReasoningSummary{},
+							EncryptedContent: schemas.Ptr("PROTECTED_PAYLOAD"),
+						},
+					},
+				)
+				wantItems = 4
+			}
+
 			callCount := 0
 			var secondAttemptInput []schemas.ResponsesMessage
 			handler := func(_ schemas.Key) (string, *schemas.BifrostError) {
@@ -264,8 +293,8 @@ func TestExecuteRequestWithRetries_HealsOnEveryProviderRejection(t *testing.T) {
 			if callCount != 2 {
 				t.Fatalf("expected 2 attempts (original + stripped retry), got %d", callCount)
 			}
-			if len(secondAttemptInput) != 2 {
-				t.Fatalf("expected both input items to survive the strip, got %d", len(secondAttemptInput))
+			if len(secondAttemptInput) != wantItems {
+				t.Fatalf("expected every input item to survive the strip, got %d", len(secondAttemptInput))
 			}
 			reasoning := secondAttemptInput[1].ResponsesReasoning
 			if reasoning == nil {
@@ -273,6 +302,12 @@ func TestExecuteRequestWithRetries_HealsOnEveryProviderRejection(t *testing.T) {
 			}
 			if reasoning.EncryptedContent != nil {
 				t.Errorf("expected encrypted_content to be stripped, got %q", *reasoning.EncryptedContent)
+			}
+			if wantItems == 4 {
+				protected := secondAttemptInput[3].ResponsesReasoning
+				if protected == nil || protected.EncryptedContent == nil || *protected.EncryptedContent != "PROTECTED_PAYLOAD" {
+					t.Errorf("expected the latest assistant turn to reach the retry untouched, got %+v", protected)
+				}
 			}
 		})
 	}
@@ -1277,6 +1312,27 @@ func newThinkingSignatureChatRequest(signature string) *schemas.BifrostRequest {
 						},
 					},
 				},
+				// Anthropic protects the LATEST assistant turn, so the fixture carries a
+				// second one: Input[1] is the earlier turn the strip may rewrite, Input[3]
+				// the one it must leave byte-for-byte alone.
+				{
+					Role:    schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("now lint it")},
+				},
+				{
+					Role:    schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("Linting.")},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{
+						ReasoningDetails: []schemas.ChatReasoningDetails{
+							{
+								Index:     0,
+								Type:      schemas.BifrostReasoningDetailsTypeText,
+								Text:      schemas.Ptr("planning the lint"),
+								Signature: schemas.Ptr(signature + "-latest"),
+							},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -1889,8 +1945,8 @@ func TestExecuteRequestWithRetries_HealsThinkingSignatureOnChatShape(t *testing.
 	if callCount != 2 {
 		t.Fatalf("expected 2 attempts (original + stripped retry), got %d", callCount)
 	}
-	if len(secondAttemptInput) != 2 {
-		t.Fatalf("expected both messages to survive, got %d", len(secondAttemptInput))
+	if len(secondAttemptInput) != 4 {
+		t.Fatalf("expected every message to survive, got %d", len(secondAttemptInput))
 	}
 	details := secondAttemptInput[1].ChatAssistantMessage.ReasoningDetails
 	if len(details) != 1 {
@@ -1898,5 +1954,255 @@ func TestExecuteRequestWithRetries_HealsThinkingSignatureOnChatShape(t *testing.
 	}
 	if details[0].Signature != nil {
 		t.Errorf("expected the signature to be gone from the retry, got %q", *details[0].Signature)
+	}
+
+	// The latest assistant turn is Anthropic's protected turn: rewriting it earns
+	// "`thinking` or `redacted_thinking` blocks in the latest assistant message cannot
+	// be modified", so the retry must carry it exactly as it arrived.
+	latest := secondAttemptInput[3].ChatAssistantMessage.ReasoningDetails
+	if len(latest) != 1 {
+		t.Fatalf("expected the latest turn's reasoning detail to survive, got %d", len(latest))
+	}
+	if latest[0].Signature == nil || *latest[0].Signature != "ErUBCkYIBRgCKkD...-latest" {
+		t.Errorf("expected the latest assistant turn's signature to be untouched, got %+v", latest[0].Signature)
+	}
+}
+
+// newAnthropicThinkingResponsesRequest is the shape an Anthropic-dialect client replays
+// through the Responses path: /anthropic/v1/messages with a Bedrock-served Claude model
+// takes no passthrough (isClaudeModel excludes Bedrock), so the turn arrives as
+// Responses items and leaves through the Bedrock Converse converter.
+//
+// Two assistant turns, each a reasoning item plus a tool call, separated by the tool
+// result that ends the first. Items 1-2 are the earlier turn the strip may rewrite;
+// items 4-5 are the latest assistant turn, which Anthropic protects.
+func newAnthropicThinkingResponsesRequest() *schemas.BifrostRequest {
+	reasoning := func(id, text, signature string) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{
+			ID:   schemas.Ptr(id),
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
+			Content: &schemas.ResponsesMessageContent{
+				ContentBlocks: []schemas.ResponsesMessageContentBlock{{
+					Type:      schemas.ResponsesOutputMessageContentTypeReasoning,
+					Text:      schemas.Ptr(text),
+					Signature: schemas.Ptr(signature),
+				}},
+			},
+		}
+	}
+	toolCall := func(callID string) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+			ResponsesToolMessage: &schemas.ResponsesToolMessage{
+				CallID:    schemas.Ptr(callID),
+				Name:      schemas.Ptr("bash"),
+				Arguments: schemas.Ptr(`{}`),
+			},
+		}
+	}
+
+	return &schemas.BifrostRequest{
+		RequestType: schemas.ResponsesRequest,
+		ResponsesRequest: &schemas.BifrostResponsesRequest{
+			Provider: schemas.Bedrock,
+			Model:    "global.anthropic.claude-opus-5",
+			Input: []schemas.ResponsesMessage{
+				{
+					Type:    schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+					Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+					Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("refactor this")},
+				},
+				reasoning("rs_earlier", "planning the refactor", "SIG_EARLIER"),
+				toolCall("toolu_earlier"),
+				{
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+					Status: schemas.Ptr("completed"),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: schemas.Ptr("toolu_earlier"),
+						Output: &schemas.ResponsesToolMessageOutputStruct{
+							ResponsesToolCallOutputStr: schemas.Ptr("done"),
+						},
+					},
+				},
+				reasoning("rs_latest", "planning the edit", "SIG_LATEST"),
+				toolCall("toolu_latest"),
+				{
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+					Status: schemas.Ptr("completed"),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: schemas.Ptr("toolu_latest"),
+						Output: &schemas.ResponsesToolMessageOutputStruct{
+							ResponsesToolCallOutputStr: schemas.Ptr("done"),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// TestStripResponsesEncryptedContent_ProtectsLatestAnthropicAssistantTurn is the
+// regression test for the reported defect.
+//
+// A complexity router picks a model per turn, so turn N+1 replays a thinking block
+// minted by whichever model answered turn N and the new model refuses the signature it
+// did not issue. isEncryptedReasoningRejection catches that and the strip retries --
+// but the strip blanked signatures on EVERY assistant turn, including the latest, which
+// Anthropic forbids editing. The retry therefore earned a second, different 400:
+//
+//	messages.N.content.M: `thinking` or `redacted_thinking` blocks in the latest
+//	assistant message cannot be modified.
+//
+// and that is the error the client was left holding, with the signature refusal that
+// actually caused it never surfacing. The raw Anthropic chat rewrite already protected
+// this turn (see stripRawAnthropicChatThinking); the typed shapes did not.
+func TestStripResponsesEncryptedContent_ProtectsLatestAnthropicAssistantTurn(t *testing.T) {
+	req := newAnthropicThinkingResponsesRequest()
+
+	if !stripResponsesEncryptedContent(nil, req) {
+		t.Fatal("expected the earlier assistant turn to be strippable")
+	}
+
+	input := req.ResponsesRequest.Input
+	if len(input) != 7 {
+		t.Fatalf("expected every item to survive, got %d", len(input))
+	}
+
+	earlier := input[1].Content.ContentBlocks[0]
+	if earlier.Signature != nil {
+		t.Errorf("expected the earlier turn's signature to be cleared, got %q", *earlier.Signature)
+	}
+	if earlier.Text == nil || *earlier.Text != "planning the refactor" {
+		t.Errorf("expected the earlier turn's reasoning text to survive, got %+v", earlier.Text)
+	}
+
+	latest := input[4].Content.ContentBlocks[0]
+	if latest.Signature == nil || *latest.Signature != "SIG_LATEST" {
+		t.Errorf("expected the latest assistant turn's signature to be untouched, got %+v", latest.Signature)
+	}
+}
+
+// A redacted_thinking block replays as a reasoning item carrying only encrypted_content.
+// In the protected turn the strip used to delete the item outright -- a partial drop,
+// which Anthropic refuses in the same breath as an edit.
+func TestStripResponsesEncryptedContent_KeepsRedactedThinkingInProtectedTurn(t *testing.T) {
+	req := newAnthropicThinkingResponsesRequest()
+	input := req.ResponsesRequest.Input
+	input[4] = schemas.ResponsesMessage{
+		ID:   schemas.Ptr("rs_latest"),
+		Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
+		ResponsesReasoning: &schemas.ResponsesReasoning{
+			Summary:          []schemas.ResponsesReasoningSummary{},
+			EncryptedContent: schemas.Ptr("REDACTED_BLOB"),
+		},
+	}
+
+	stripResponsesEncryptedContent(nil, req)
+
+	got := req.ResponsesRequest.Input
+	if len(got) != 7 {
+		t.Fatalf("expected the redacted item in the protected turn to survive, got %d items", len(got))
+	}
+	if got[4].ResponsesReasoning == nil || got[4].ResponsesReasoning.EncryptedContent == nil ||
+		*got[4].ResponsesReasoning.EncryptedContent != "REDACTED_BLOB" {
+		t.Errorf("expected the protected turn's redacted payload to be untouched, got %+v", got[4].ResponsesReasoning)
+	}
+}
+
+// When the only unverifiable payload sits in the protected turn there is nothing the
+// strip may legally rewrite, so it must report no change: a true there spends the one
+// retry on an identical request and returns a worse error than the one it replaced.
+func TestStripResponsesEncryptedContent_NoRetryWhenOnlyProtectedTurnIsUnverifiable(t *testing.T) {
+	req := newAnthropicThinkingResponsesRequest()
+	// Drop the earlier turn, leaving a single assistant turn -- the protected one.
+	req.ResponsesRequest.Input = req.ResponsesRequest.Input[4:]
+
+	if stripResponsesEncryptedContent(nil, req) {
+		t.Error("expected no change when only the protected assistant turn carries a signature")
+	}
+	if sig := req.ResponsesRequest.Input[0].Content.ContentBlocks[0].Signature; sig == nil || *sig != "SIG_LATEST" {
+		t.Errorf("expected the protected signature to be left alone, got %+v", sig)
+	}
+}
+
+// The protection is Anthropic's rule, not a universal one. OpenAI has no protected turn
+// and its refusal is routinely about a payload in the last assistant turn, so gating the
+// rewrite on the family is what keeps the original heal working.
+func TestStripResponsesEncryptedContent_OpenAILastTurnStillStripped(t *testing.T) {
+	req := newEncryptedReasoningRequest("ciphertext")
+
+	if !stripResponsesEncryptedContent(nil, req) {
+		t.Fatal("expected an OpenAI request's trailing reasoning item to still be stripped")
+	}
+	if got := req.ResponsesRequest.Input[1].ResponsesReasoning.EncryptedContent; got != nil {
+		t.Errorf("expected encrypted_content to be cleared for OpenAI, got %q", *got)
+	}
+}
+
+// latestAssistantTurnStart has to find the turn, not the last item: a tool-result round
+// trip ends on function_call_output, and one assistant turn spans several items.
+func TestLatestAssistantTurnStart(t *testing.T) {
+	msg := func(role schemas.ResponsesMessageRoleType) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+			Role: schemas.Ptr(role),
+		}
+	}
+	item := func(t schemas.ResponsesMessageType) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{Type: schemas.Ptr(t)}
+	}
+
+	tests := []struct {
+		name  string
+		input []schemas.ResponsesMessage
+		want  int
+	}{
+		{"empty", nil, 0},
+		{
+			"user only -- no assistant turn to protect",
+			[]schemas.ResponsesMessage{msg(schemas.ResponsesInputMessageRoleUser)},
+			1,
+		},
+		{
+			"turn spans reasoning + message + call",
+			[]schemas.ResponsesMessage{
+				msg(schemas.ResponsesInputMessageRoleUser),
+				item(schemas.ResponsesMessageTypeReasoning),
+				msg(schemas.ResponsesInputMessageRoleAssistant),
+				item(schemas.ResponsesMessageTypeFunctionCall),
+			},
+			1,
+		},
+		{
+			"trailing tool results are skipped, not counted as the turn",
+			[]schemas.ResponsesMessage{
+				msg(schemas.ResponsesInputMessageRoleUser),
+				item(schemas.ResponsesMessageTypeReasoning),
+				item(schemas.ResponsesMessageTypeFunctionCall),
+				item(schemas.ResponsesMessageTypeFunctionCallOutput),
+				item(schemas.ResponsesMessageTypeReasoning),
+				item(schemas.ResponsesMessageTypeFunctionCall),
+				item(schemas.ResponsesMessageTypeFunctionCallOutput),
+			},
+			4,
+		},
+		{
+			"a user message ends the turn just as a tool result does",
+			[]schemas.ResponsesMessage{
+				item(schemas.ResponsesMessageTypeReasoning),
+				msg(schemas.ResponsesInputMessageRoleUser),
+				item(schemas.ResponsesMessageTypeReasoning),
+				msg(schemas.ResponsesInputMessageRoleAssistant),
+			},
+			2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := latestAssistantTurnStart(tt.input); got != tt.want {
+				t.Errorf("latestAssistantTurnStart() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
