@@ -51,7 +51,7 @@
         "Issuer": "${AQUADOOR_OBO_ISSUER}",
         "BackendProjectID": "${AQUADOOR_OBO_BACKEND_PROJECT_ID}",
         "UpstreamClientID": "${AQUADOOR_OBO_UPSTREAM_CLIENT_ID}",
-        "RunnerToolPrefixes": ["aquadoor-runner-"],
+        "RunnerToolPrefixes": ["aquadoor_runner_"],
         "RunnerClients": ${AQUADOOR_OBO_RUNNER_CLIENTS},
         "RunnerAudience": "${AQUADOOR_OBO_RUNNER_AUDIENCE}",
         "Strategy": "impersonation"
