@@ -59,6 +59,16 @@ func (p *OboPlugin) PreMCPHook(
 	if req == nil || !p.runnerClients[req.ClientName] {
 		return req, nil, nil // not a runner client → untouched (its own static auth applies)
 	}
+	// OBO applies ONLY to tool EXECUTION. Discovery (list_tools) + ping are internal Bifrost
+	// operations with NO acting user — they authenticate via the connection's injected machine
+	// actor token (PreMCPConnectionHook), and the runner serves its full catalog to any
+	// authenticated caller (per-user enforcement is on tools/call, never tools/list). Enforcing a
+	// VK here would block tool_discovery's list_tools with "no virtual key on a runner MCP call",
+	// leaving every runner client "unstable" with 0 tools federated. Only inject the per-user OBO
+	// token on an actual execute.
+	if !req.RequestType.IsExecuteTool() {
+		return req, nil, nil
+	}
 	vk := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyVirtualKey)
 	if vk == "" {
 		return req, blockMCP("obo_no_identity", "no virtual key on a runner MCP call"), nil

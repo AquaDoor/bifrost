@@ -42,7 +42,7 @@ func TestOboPlugin_InjectsTokenForRunnerClient(t *testing.T) {
 	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
 
 	ctx := mkCtx("sk-bf-user")
-	req := &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner"}
+	req := &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner", RequestType: schemas.MCPRequestTypeExecuteTool}
 	out, sc, err := p.PreMCPHook(ctx, req)
 	if err != nil {
 		t.Fatal(err)
@@ -79,9 +79,35 @@ func TestOboPlugin_FailsClosedWithoutVK(t *testing.T) {
 	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
 
 	ctx := mkCtx("") // no virtual key
-	_, sc, _ := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner"})
+	_, sc, _ := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner", RequestType: schemas.MCPRequestTypeExecuteTool})
 	if sc == nil || sc.Error == nil || sc.Error.Error == nil || *sc.Error.Error.Code != "obo_no_identity" {
 		t.Fatalf("expected obo_no_identity block, got %+v", sc)
+	}
+}
+
+func TestOboPlugin_AllowsDiscoveryWithoutVK(t *testing.T) {
+	// Regression (#1780): tool_discovery lists a runner client's catalog with NO virtual key — it
+	// authenticates via the connection's injected machine actor token (PreMCPConnectionHook), NOT a
+	// per-user OBO token, and the runner serves the full catalog to any authenticated caller.
+	// PreMCPHook must therefore be a no-op for list_tools / ping (and an unset type); enforcing a VK
+	// there blocked discovery with "no virtual key on a runner MCP call" → every runner client went
+	// "unstable" with 0 tools federated. Only execute_tool requires the VK + OBO mint.
+	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
+	svc := testService(t, m, StrategyImpersonation)
+	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
+
+	for _, rt := range []schemas.MCPRequestType{schemas.MCPRequestTypeListTools, schemas.MCPRequestTypePing, ""} {
+		ctx := mkCtx("") // no virtual key, exactly as during connection-verification discovery
+		_, sc, err := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner", RequestType: rt})
+		if err != nil {
+			t.Fatalf("rt=%q: unexpected err %v", rt, err)
+		}
+		if sc != nil {
+			t.Fatalf("rt=%q: a non-execute op must NOT be blocked, got %+v", rt, sc.Error)
+		}
+		if injectedAuth(ctx) != "" {
+			t.Errorf("rt=%q: must NOT inject a per-user OBO token on a non-execute op", rt)
+		}
 	}
 }
 
@@ -146,7 +172,7 @@ func TestOboPlugin_FailsClosedOnUnresolvedUser(t *testing.T) {
 	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "", err: context.DeadlineExceeded}, nil)
 
 	ctx := mkCtx("sk-bf-user")
-	_, sc, _ := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner"})
+	_, sc, _ := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner", RequestType: schemas.MCPRequestTypeExecuteTool})
 	if sc == nil || sc.Error == nil {
 		t.Fatal("expected a fail-closed block when the acting user can't be resolved")
 	}
