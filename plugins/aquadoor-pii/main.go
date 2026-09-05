@@ -14,6 +14,7 @@
 package aquadoorpii
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -81,7 +82,17 @@ func (p *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostReq
 func (p *Plugin) PreLLMHook(
 	bctx *schemas.BifrostContext,
 	req *schemas.BifrostRequest,
-) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+) (outReq *schemas.BifrostRequest, sc *schemas.LLMPluginShortCircuit, err error) {
+	// Fail-closed panic guard (#1780 §7.5 / G010): a panic anywhere in redaction must NEVER let an
+	// un-redacted prompt egress, and must not crash the gateway. Recover → BLOCK the request
+	// (fail-closed short-circuit, no fallback), so a redaction bug degrades to "denied", never "leaked".
+	defer func() {
+		if r := recover(); r != nil {
+			outReq = req
+			sc = blockShortCircuit("pii_panic", fmt.Sprintf("PII guardrail panicked: %v (blocked fail-closed)", r))
+			err = nil
+		}
+	}()
 	if req == nil {
 		return req, nil, nil
 	}
