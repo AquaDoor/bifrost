@@ -1,54 +1,41 @@
 // Package aquadoorpii is the AquaDoor fail-closed PII guardrail — an in-tree Bifrost LLMPlugin that
 // redacts RU/PII from every outbound prompt before off-shore LLM egress (152-ФЗ, posture C /
-// #1780 §7.5). It calls the forked Presidio analyzer/anonymizer (infra/presidio-ru, with the
-// checksum-gated RU recognizers).
+// #1780 §7.5). Recognition runs IN-PROCESS (recognizers.go: checksum-gated RU_INN/RU_OGRN/
+// RU_OGRNIP + context-gated RU_PHONE/RU_PASSPORT) — there is no external Presidio service. That
+// is the whole point: no separate Python/spaCy image to deploy or keep alive (no swarm RAM cost),
+// and no network hop that can time out and fail OPEN.
 //
 // CRITICAL — Bifrost plugin errors FAIL OPEN (they are logged as warnings, not returned to the
 // caller — core/schemas/plugin.go). To fail CLOSED we NEVER return a bare Go error from
 // PreLLMHook; every block path returns a *LLMPluginShortCircuit whose Error is set with
-// AllowFallbacks=false (no fallback provider gets the un-redacted prompt).
+// AllowFallbacks=false (no fallback provider gets the un-redacted prompt). In-process recognition
+// cannot be "unavailable", so the former network-unreachable fail-closed path is gone by design;
+// the remaining fail-closed blocks (unsupported shape, raw passthrough, BLOCK entities) stay.
 package aquadoorpii
 
 import (
-	"context"
-	"net/http"
-	"time"
-
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
 // Config for the PII plugin. BlockEntities lists entity types that BLOCK the whole request
-// (vs the default: redact/mask and continue).
+// (vs the default: redact/mask and continue). Entities, when non-empty, restricts recognition to
+// those entity types. Language is retained for config compatibility (recognizers are RU).
 type Config struct {
-	AnalyzerURL   string
-	AnonymizerURL string
 	Language      string
-	TimeoutMS     int
 	Entities      []string
 	BlockEntities map[string]bool
 }
 
 type Plugin struct {
-	presidio *presidioClient
-	cfg      Config
-	timeout  time.Duration
+	cfg Config
 }
 
-// New builds the plugin. Language defaults to "ru", timeout to 800ms.
+// New builds the plugin. Language defaults to "ru".
 func New(cfg Config) *Plugin {
 	if cfg.Language == "" {
 		cfg.Language = "ru"
 	}
-	if cfg.TimeoutMS == 0 {
-		cfg.TimeoutMS = 800
-	}
-	timeout := time.Duration(cfg.TimeoutMS) * time.Millisecond
-	hc := &http.Client{Timeout: timeout}
-	return &Plugin{
-		presidio: newPresidioClient(cfg.AnalyzerURL, cfg.AnonymizerURL, cfg.Language, hc),
-		cfg:      cfg,
-		timeout:  timeout,
-	}
+	return &Plugin{cfg: cfg}
 }
 
 func (p *Plugin) GetName() string { return "aquadoor-pii" }
@@ -90,29 +77,16 @@ func (p *Plugin) PreLLMHook(
 		if text == "" {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-		results, err := p.presidio.analyze(ctx, text, p.cfg.Entities)
-		if err != nil {
-			cancel()
-			return req, blockShortCircuit("pii_guardrail_unavailable",
-				"PII guardrail could not verify the request; blocked (fail-closed): "+err.Error()), nil
-		}
+		// In-process recognition (recognizers.go): deterministic, no I/O, cannot fail open.
+		results := recognize(text, p.cfg.Entities)
 		for _, r := range results {
 			if p.cfg.BlockEntities[r.EntityType] {
-				cancel()
 				return req, blockShortCircuit("pii_blocked", "blocked PII entity: "+r.EntityType), nil
 			}
 		}
 		if len(results) > 0 {
-			red, err := p.presidio.anonymize(ctx, text, results)
-			if err != nil {
-				cancel()
-				return req, blockShortCircuit("pii_guardrail_unavailable",
-					"PII anonymize failed; blocked (fail-closed): "+err.Error()), nil
-			}
-			span.set(red)
+			span.set(anonymize(text, results))
 		}
-		cancel()
 	}
 	return req, nil, nil
 }

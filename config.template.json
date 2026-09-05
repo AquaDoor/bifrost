@@ -38,10 +38,7 @@
       "name": "aquadoor-pii",
       "enabled": true,
       "config": {
-        "AnalyzerURL": "${AQUADOOR_PRESIDIO_ANALYZER_URL}",
-        "AnonymizerURL": "${AQUADOOR_PRESIDIO_ANONYMIZER_URL}",
         "Language": "ru",
-        "TimeoutMS": 5000,
         "BlockEntities": { "RU_INN": true, "RU_OGRN": true, "RU_OGRNIP": true, "RU_PASSPORT": true }
       }
     },

@@ -157,8 +157,9 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		return modelcatalogresolver.Init(bifrostConfig.ModelCatalog, logger)
 
 	case "aquadoor-pii":
-		// AquaDoor fail-closed Presidio PII egress guardrail (#1780 §7.5). Fully config-driven
-		// (analyzer/anonymizer URLs, language, entities); no secrets, no runtime deps.
+		// AquaDoor fail-closed RU PII egress guardrail (#1780 §7.5). In-process recognition (no
+		// external Presidio service). Config-driven (language, entities, block-entities); no secrets,
+		// no runtime deps.
 		cfg, err := MarshalPluginConfig[aquadoorpii.Config](pluginConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal aquadoor-pii plugin config: %w", err)
@@ -363,17 +364,12 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 
 	// 11. AquaDoor PII egress guardrail (#1780 §7.5). Runs late (after compat) so it redacts the
 	// fully-assembled request before egress; its runtime fail-closed (Presidio error/timeout → block)
-	// lives in the plugin. Self-configuring: registers only when an analyzer URL is set, so the
-	// gateway boots cleanly BEFORE Presidio is deployed (incremental rollout — B1 before B7) instead
-	// of fail-closed-blocking every completion. Cutover (C2) MUST NOT proceed with it disabled — the
-	// loud warning + the C1.4 PII acceptance test enforce that.
+	// lives in the plugin. Recognition is now IN-PROCESS (no external Presidio service), so the
+	// guardrail is ON whenever the config block is enabled — there is no URL to wait for and no
+	// incremental "boot before Presidio" gap. It cannot fail open (no network hop). Cutover (C2)
+	// runs with it enabled; the C1.4 PII acceptance test enforces that.
 	if piiConfig := s.getPluginConfig("aquadoor-pii"); piiConfig != nil && piiConfig.Enabled {
-		if cfg, _ := MarshalPluginConfig[aquadoorpii.Config](piiConfig.Config); cfg != nil && cfg.AnalyzerURL != "" {
-			s.registerPluginWithStatus(ctx, "aquadoor-pii", nil, piiConfig.Config, false)
-		} else {
-			s.markPluginDisabled("aquadoor-pii")
-			logger.Warn("aquadoor-pii enabled but no AnalyzerURL — PII guardrail is OFF (set AQUADOOR_PRESIDIO_ANALYZER_URL); MUST be configured before cutover")
-		}
+		s.registerPluginWithStatus(ctx, "aquadoor-pii", nil, piiConfig.Config, false)
 	} else {
 		s.markPluginDisabled("aquadoor-pii")
 	}

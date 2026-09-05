@@ -2,8 +2,6 @@ package aquadoorpii
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -24,32 +22,14 @@ func chatReq(text string) *schemas.BifrostRequest {
 	}
 }
 
-func jsonHandler(status int, body string) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
-	}
+func plugin(block map[string]bool) *Plugin {
+	return New(Config{Language: "ru", BlockEntities: block})
 }
 
-func pluginFor(t *testing.T, analyze, anonymize http.HandlerFunc, block map[string]bool) *Plugin {
-	a := httptest.NewServer(analyze)
-	n := httptest.NewServer(anonymize)
-	t.Cleanup(func() { a.Close(); n.Close() })
-	return New(Config{
-		AnalyzerURL:   a.URL,
-		AnonymizerURL: n.URL,
-		Language:      "ru",
-		TimeoutMS:     2000,
-		BlockEntities: block,
-	})
-}
-
+// A valid INN with no BLOCK config → redacted in-process to <RU_INN>.
 func TestPII_RedactsDetectedEntity(t *testing.T) {
-	p := pluginFor(t,
-		jsonHandler(200, `[{"entity_type":"RU_INN","start":8,"end":18,"score":1.0}]`),
-		jsonHandler(200, `{"text":"мой ИНН <RU_INN>"}`), nil)
-	req := chatReq("мой ИНН 7830002293")
+	p := plugin(nil)
+	req := chatReq("мой ИНН 7830002293 вот")
 	out, sc, err := p.PreLLMHook(nil, req)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -57,46 +37,29 @@ func TestPII_RedactsDetectedEntity(t *testing.T) {
 	if sc != nil {
 		t.Fatalf("unexpected short-circuit: %+v", sc)
 	}
-	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != "мой ИНН <RU_INN>" {
+	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != "мой ИНН <RU_INN> вот" {
 		t.Errorf("not redacted: %q", got)
 	}
 }
 
-func TestPII_FailsClosedOnPresidioDown(t *testing.T) {
-	p := pluginFor(t, jsonHandler(500, `{"error":"boom"}`), jsonHandler(200, `{}`), nil)
-	req := chatReq("мой ИНН 7830002293")
-	_, sc, err := p.PreLLMHook(nil, req)
-	if err != nil {
-		t.Fatalf("plugin must not return a bare error (fails open): %v", err)
+// A random 10-digit number that FAILS the INN checksum must NOT be detected as an INN (the
+// checksum is the gate, not the regex) — and with no passport context it is not a passport either.
+func TestPII_ChecksumGate_RandomNumberNotRedacted(t *testing.T) {
+	p := plugin(nil)
+	req := chatReq("заказ 1234567890 готов")
+	out, sc, err := p.PreLLMHook(nil, req)
+	if err != nil || sc != nil {
+		t.Fatalf("expected passthrough, sc=%v err=%v", sc, err)
 	}
-	if sc == nil || sc.Error == nil {
-		t.Fatal("expected a blocking short-circuit when Presidio is down")
-	}
-	if sc.Error.StatusCode == nil || *sc.Error.StatusCode != 403 {
-		t.Error("expected 403 status")
-	}
-	if sc.Error.AllowFallbacks == nil || *sc.Error.AllowFallbacks {
-		t.Error("expected AllowFallbacks=false (no fallback sees the un-redacted prompt)")
-	}
-	if *req.ChatRequest.Input[0].Content.ContentStr != "мой ИНН 7830002293" {
-		t.Error("text must be untouched on a block (request is dropped, not forwarded)")
-	}
-}
-
-func TestPII_FailsClosedOnErrorBody(t *testing.T) {
-	// 200 but a dict {"error":...} is a Presidio failure, not an empty result → fail closed.
-	p := pluginFor(t, jsonHandler(200, `{"error":"No text provided"}`), jsonHandler(200, `{}`), nil)
-	_, sc, _ := p.PreLLMHook(nil, chatReq("hi"))
-	if sc == nil {
-		t.Fatal("expected a block on an analyzer error body")
+	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != "заказ 1234567890 готов" {
+		t.Errorf("random non-INN number should be untouched, got %q", got)
 	}
 }
 
 func TestPII_BlocksConfiguredEntity(t *testing.T) {
-	p := pluginFor(t,
-		jsonHandler(200, `[{"entity_type":"RU_PASSPORT","start":0,"end":10,"score":0.9}]`),
-		jsonHandler(200, `{"text":"x"}`), map[string]bool{"RU_PASSPORT": true})
-	_, sc, _ := p.PreLLMHook(nil, chatReq("12 34 567890"))
+	p := plugin(map[string]bool{"RU_INN": true})
+	// A valid INN is a BLOCK entity → the whole request is refused (fail-closed).
+	_, sc, _ := p.PreLLMHook(nil, chatReq("ИНН 7830002293"))
 	if sc == nil || sc.Error == nil {
 		t.Fatal("expected a block for the configured BLOCK entity")
 	}
@@ -105,8 +68,24 @@ func TestPII_BlocksConfiguredEntity(t *testing.T) {
 	}
 }
 
+// Passport is context-gated: a bare 10-digit-shaped number with NO passport context is not flagged
+// (avoids redacting every order number), but WITH context it is a blocked passport.
+func TestPII_Passport_ContextGated(t *testing.T) {
+	block := map[string]bool{"RU_PASSPORT": true}
+	// No context → not detected → passes through.
+	if _, sc, _ := plugin(block).PreLLMHook(nil, chatReq("номер 12 34 567890")); sc != nil {
+		t.Fatalf("bare number without passport context must not block, got %+v", sc)
+	}
+	// With context → blocked.
+	_, sc, _ := plugin(block).PreLLMHook(nil, chatReq("паспорт серия 12 34 567890"))
+	if sc == nil || sc.Error == nil || sc.Error.Error == nil || sc.Error.Error.Code == nil ||
+		*sc.Error.Error.Code != "pii_blocked" {
+		t.Fatalf("passport with context must block, got %+v", sc)
+	}
+}
+
 func TestPII_PassthroughWhenNoEntities(t *testing.T) {
-	p := pluginFor(t, jsonHandler(200, `[]`), jsonHandler(200, `{}`), nil)
+	p := plugin(nil)
 	req := chatReq("no pii here")
 	_, sc, err := p.PreLLMHook(nil, req)
 	if err != nil || sc != nil {
@@ -117,48 +96,44 @@ func TestPII_PassthroughWhenNoEntities(t *testing.T) {
 	}
 }
 
-// TestPII_RedactsEmbeddingInput — the RAG embedding path MUST be redacted, never blocked (#1780 review).
+// The RAG embedding path MUST be redacted, never blocked (#1780 review) — even for a BLOCK-listed
+// entity, the embedding path only ever redacts (blocking config applies to chat/completion).
 func TestPII_RedactsEmbeddingInput(t *testing.T) {
-	p := pluginFor(t,
-		jsonHandler(200, `[{"entity_type":"RU_INN","start":8,"end":18,"score":1.0}]`),
-		jsonHandler(200, `{"text":"мой ИНН <RU_INN>"}`), nil)
+	p := plugin(nil)
 	req := &schemas.BifrostRequest{
 		EmbeddingRequest: &schemas.BifrostEmbeddingRequest{
-			Input: &schemas.EmbeddingInput{Text: schemas.Ptr("мой ИНН 7830002293")},
+			Input: &schemas.EmbeddingInput{Text: schemas.Ptr("мой ИНН 7830002293 тут")},
 		},
 	}
 	out, sc, err := p.PreLLMHook(nil, req)
 	if err != nil || sc != nil {
 		t.Fatalf("embedding must be redacted, not blocked: sc=%v err=%v", sc, err)
 	}
-	if got := *out.EmbeddingRequest.Input.Text; got != "мой ИНН <RU_INN>" {
+	if got := *out.EmbeddingRequest.Input.Text; got != "мой ИНН <RU_INN> тут" {
 		t.Errorf("embedding text not redacted: %q", got)
 	}
 }
 
-// TestPII_RedactsImageGenPrompt — the image-generation prompt carries PII text; redact, don't block.
 func TestPII_RedactsImageGenPrompt(t *testing.T) {
-	p := pluginFor(t,
-		jsonHandler(200, `[{"entity_type":"RU_INN","start":8,"end":18,"score":1.0}]`),
-		jsonHandler(200, `{"text":"портрет <RU_INN>"}`), nil)
+	p := plugin(nil)
 	req := &schemas.BifrostRequest{
 		ImageGenerationRequest: &schemas.BifrostImageGenerationRequest{
-			Input: &schemas.ImageGenerationInput{Prompt: "портрет 7830002293"},
+			Input: &schemas.ImageGenerationInput{Prompt: "портрет ИНН 7830002293"},
 		},
 	}
 	out, sc, err := p.PreLLMHook(nil, req)
 	if err != nil || sc != nil {
 		t.Fatalf("image-gen prompt must be redacted, not blocked: sc=%v err=%v", sc, err)
 	}
-	if got := out.ImageGenerationRequest.Input.Prompt; got != "портрет <RU_INN>" {
+	if got := out.ImageGenerationRequest.Input.Prompt; got != "портрет ИНН <RU_INN>" {
 		t.Errorf("image prompt not redacted: %q", got)
 	}
 }
 
-// TestPII_BlocksUnsupportedShape — a prompt-bearing shape collectTextSpans doesn't cover must fail
-// closed (block), not silently forward un-redacted (the #1780-review fail-OPEN).
+// A prompt-bearing shape collectTextSpans doesn't cover must fail closed (block), not silently
+// forward un-redacted (the #1780-review fail-OPEN).
 func TestPII_BlocksUnsupportedShape(t *testing.T) {
-	p := pluginFor(t, jsonHandler(200, `[]`), jsonHandler(200, `{}`), nil)
+	p := plugin(nil)
 	req := &schemas.BifrostRequest{RerankRequest: &schemas.BifrostRerankRequest{}}
 	_, sc, err := p.PreLLMHook(nil, req)
 	if err != nil {
@@ -173,10 +148,9 @@ func TestPII_BlocksUnsupportedShape(t *testing.T) {
 	}
 }
 
-// TestPII_BlocksRawPassthrough — a raw request-body passthrough egresses the ORIGINAL bytes, which
-// span redaction never touches; the guardrail must block it (fail-closed).
+// A raw request-body passthrough egresses the ORIGINAL bytes span redaction never touches; block it.
 func TestPII_BlocksRawPassthrough(t *testing.T) {
-	p := pluginFor(t, jsonHandler(200, `[]`), jsonHandler(200, `{}`), nil)
+	p := plugin(nil)
 	bctx := schemas.NewBifrostContextWithValue(context.Background(), time.Time{}, "seed", "x")
 	bctx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, true)
 	_, sc, err := p.PreLLMHook(bctx, chatReq("мой ИНН 7830002293"))
