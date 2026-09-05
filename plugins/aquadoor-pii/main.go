@@ -14,28 +14,59 @@
 package aquadoorpii
 
 import (
+	"strings"
+
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-// Config for the PII plugin. BlockEntities lists entity types that BLOCK the whole request
-// (vs the default: redact/mask and continue). Entities, when non-empty, restricts recognition to
-// those entity types. Language is retained for config compatibility (recognizers are RU).
+// Per-entity action. "allow" leaves the value untouched (it is not personal data — e.g. a
+// legal-entity INN/OGRN, the payload of B2B tender/dealer analysis); "redact" masks it as <TYPE>
+// before egress (the §7.5 primary mechanism for personal data); "block" refuses the whole request.
+const (
+	actionAllow  = "allow"
+	actionRedact = "redact"
+	actionBlock  = "block"
+)
+
+// Config for the PII plugin. Actions maps an entity type → action (allow|redact|block); a type not
+// listed uses DefaultAction (default "redact", so an unclassified detection fails safe by masking).
+// Entities, when non-empty, restricts recognition to those types. Language is retained for config
+// compatibility (recognizers are RU).
 type Config struct {
 	Language      string
 	Entities      []string
-	BlockEntities map[string]bool
+	Actions       map[string]string
+	DefaultAction string
 }
 
 type Plugin struct {
 	cfg Config
 }
 
-// New builds the plugin. Language defaults to "ru".
+// New builds the plugin. Language defaults to "ru"; DefaultAction to "redact".
 func New(cfg Config) *Plugin {
 	if cfg.Language == "" {
 		cfg.Language = "ru"
 	}
+	if cfg.DefaultAction == "" {
+		cfg.DefaultAction = actionRedact
+	}
 	return &Plugin{cfg: cfg}
+}
+
+// actionFor returns the configured action for an entity type (case-insensitive value), or the
+// default. An unknown action value falls back to the default (fail-safe — never silently allow).
+func (p *Plugin) actionFor(entityType string) string {
+	a := p.cfg.DefaultAction
+	if v, ok := p.cfg.Actions[entityType]; ok {
+		a = strings.ToLower(strings.TrimSpace(v))
+	}
+	switch a {
+	case actionAllow, actionRedact, actionBlock:
+		return a
+	default:
+		return actionRedact
+	}
 }
 
 func (p *Plugin) GetName() string { return "aquadoor-pii" }
@@ -72,6 +103,9 @@ func (p *Plugin) PreLLMHook(
 		return req, blockShortCircuit("pii_unsupported_shape",
 			"PII guardrail cannot redact a "+shape+" request; blocked (fail-closed)"), nil
 	}
+	// A RAG embedding is NEVER blocked (§7.5 review — a blocked embedding would silently break
+	// retrieval); a block-action entity is redacted instead on that path.
+	blockAllowed := req.EmbeddingRequest == nil
 	for _, span := range collectTextSpans(req) {
 		text := span.get()
 		if text == "" {
@@ -79,13 +113,22 @@ func (p *Plugin) PreLLMHook(
 		}
 		// In-process recognition (recognizers.go): deterministic, no I/O, cannot fail open.
 		results := recognize(text, p.cfg.Entities)
+		var toRedact []AnalyzerResult
 		for _, r := range results {
-			if p.cfg.BlockEntities[r.EntityType] {
-				return req, blockShortCircuit("pii_blocked", "blocked PII entity: "+r.EntityType), nil
+			switch p.actionFor(r.EntityType) {
+			case actionBlock:
+				if blockAllowed {
+					return req, blockShortCircuit("pii_blocked", "blocked PII entity: "+r.EntityType), nil
+				}
+				toRedact = append(toRedact, r) // embedding: degrade block→redact rather than drop retrieval
+			case actionAllow:
+				// Not personal data (e.g. a legal-entity INN/OGRN) — leave the value intact.
+			default: // redact
+				toRedact = append(toRedact, r)
 			}
 		}
-		if len(results) > 0 {
-			span.set(anonymize(text, results))
+		if len(toRedact) > 0 {
+			span.set(anonymize(text, toRedact))
 		}
 	}
 	return req, nil, nil

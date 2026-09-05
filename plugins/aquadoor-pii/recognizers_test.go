@@ -80,12 +80,19 @@ func TestValidateOGRNIP(t *testing.T) {
 	}
 }
 
-// recognize: end-to-end span detection + the INN-vs-passport overlap resolution.
+// recognize: end-to-end span detection + INN length tagging (legal vs individual).
 func TestRecognize(t *testing.T) {
-	// Valid INN with context → detected as RU_INN.
-	rs := recognize("ИНН 7830002293", nil)
-	if len(rs) != 1 || rs[0].EntityType != entityINN {
+	// Valid 10-digit INN → legal entity.
+	if rs := recognize("ИНН 7830002293", nil); len(rs) != 1 || rs[0].EntityType != entityINNLegal {
+		t.Fatalf("expected one RU_INN_LEGAL, got %+v", rs)
+	}
+	// Valid 12-digit INN → individual.
+	if rs := recognize("ИНН 500100732259", nil); len(rs) != 1 || rs[0].EntityType != entityINN {
 		t.Fatalf("expected one RU_INN, got %+v", rs)
+	}
+	// Valid OGRN (13) → legal entity.
+	if rs := recognize("ОГРН 1027700132195", nil); len(rs) != 1 || rs[0].EntityType != entityOGRN {
+		t.Fatalf("expected one RU_OGRN, got %+v", rs)
 	}
 
 	// Random 10-digit, no passport context → nothing (INN checksum fails, passport not gated in).
@@ -108,12 +115,13 @@ func TestRecognize(t *testing.T) {
 
 	// entities filter restricts recognition.
 	if rs := recognize("ИНН 7830002293", []string{entityPhone}); len(rs) != 0 {
-		t.Fatalf("filter should exclude RU_INN, got %+v", rs)
+		t.Fatalf("filter should exclude RU_INN_LEGAL, got %+v", rs)
 	}
 }
 
 func TestAnonymize(t *testing.T) {
-	text := "ИНН 7830002293 и телефон +7 999 123 45 67"
+	// anonymize masks whatever spans it is given (the plugin filters by action before calling it).
+	text := "ИНН 500100732259 и телефон +7 999 123 45 67"
 	got := anonymize(text, recognize(text, nil))
 	want := "ИНН <RU_INN> и телефон <RU_PHONE>"
 	if got != want {

@@ -39,7 +39,15 @@
       "enabled": true,
       "config": {
         "Language": "ru",
-        "BlockEntities": { "RU_INN": true, "RU_OGRN": true, "RU_OGRNIP": true, "RU_PASSPORT": true }
+        "DefaultAction": "redact",
+        "Actions": {
+          "RU_INN_LEGAL": "allow",
+          "RU_OGRN": "allow",
+          "RU_INN": "redact",
+          "RU_OGRNIP": "redact",
+          "RU_PHONE": "redact",
+          "RU_PASSPORT": "redact"
+        }
       }
     },
     {

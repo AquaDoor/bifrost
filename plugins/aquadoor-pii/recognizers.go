@@ -37,12 +37,18 @@ type AnalyzerResult struct {
 	Score      float64
 }
 
-// Entity type identifiers (match the retired Presidio recognizers' supported_entity names, so the
-// BlockEntities config + audit strings are unchanged across the in-fork migration).
+// Entity type identifiers. INN is split by length because the two carry DIFFERENT legal status
+// under 152-ФЗ (О персональных данных): a 10-digit INN + a 13-digit OGRN identify a LEGAL ENTITY
+// (public business-registry data — NOT personal data), whereas a 12-digit INN, a 15-digit OGRNIP,
+// a passport and a phone identify an INDIVIDUAL (personal data). AquaDoor is a B2B tender/dealer
+// platform, so legal-entity identifiers are the legitimate PAYLOAD of tender/dealer analysis and
+// must NOT be masked; individual identifiers are personal data and are redacted before off-shore
+// egress. The per-type action policy (main.go Actions) encodes this, config-overridable.
 const (
-	entityINN      = "RU_INN"
-	entityOGRN     = "RU_OGRN"
-	entityOGRNIP   = "RU_OGRNIP"
+	entityINNLegal = "RU_INN_LEGAL" // 10-digit, legal entity → business data (allow by default)
+	entityINN      = "RU_INN"       // 12-digit, individual → personal data (redact)
+	entityOGRN     = "RU_OGRN"      // 13-digit, legal entity → business data (allow)
+	entityOGRNIP   = "RU_OGRNIP"    // 15-digit, individual entrepreneur → personal-ish (redact)
 	entityPhone    = "RU_PHONE"
 	entityPassport = "RU_PASSPORT"
 )
@@ -177,11 +183,18 @@ func recognize(text string, entities []string) []AnalyzerResult {
 	// high-confidence). INN before OGRNIP before OGRN is irrelevant (distinct lengths); overlap
 	// resolution below dedupes the INN-vs-passport 10-digit collision in passport's favor only when
 	// the INN checksum fails.
-	if want(entityINN) {
-		for _, m := range reINN.FindAllStringIndex(text, -1) {
-			if validateINN(text[m[0]:m[1]]) {
-				out = append(out, AnalyzerResult{EntityType: entityINN, Start: m[0], End: m[1], Score: 1.0})
-			}
+	// INN — checksum-validated, then tagged by length: 10-digit = legal entity, 12-digit = individual.
+	for _, m := range reINN.FindAllStringIndex(text, -1) {
+		match := text[m[0]:m[1]]
+		if !validateINN(match) {
+			continue
+		}
+		et := entityINN // 12-digit individual
+		if len(match) == 10 {
+			et = entityINNLegal
+		}
+		if want(et) {
+			out = append(out, AnalyzerResult{EntityType: et, Start: m[0], End: m[1], Score: 1.0})
 		}
 	}
 	if want(entityOGRN) {

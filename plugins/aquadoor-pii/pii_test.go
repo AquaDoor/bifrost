@@ -22,32 +22,50 @@ func chatReq(text string) *schemas.BifrostRequest {
 	}
 }
 
-func plugin(block map[string]bool) *Plugin {
-	return New(Config{Language: "ru", BlockEntities: block})
+// plugin builds a plugin with the AquaDoor default policy (legal-entity IDs allowed, individual PII
+// redacted), overlaying any per-test action overrides.
+func plugin(actions map[string]string) *Plugin {
+	base := map[string]string{
+		entityINNLegal: actionAllow, entityOGRN: actionAllow,
+		entityINN: actionRedact, entityOGRNIP: actionRedact,
+		entityPhone: actionRedact, entityPassport: actionRedact,
+	}
+	for k, v := range actions {
+		base[k] = v
+	}
+	return New(Config{Language: "ru", Actions: base})
 }
 
-// A valid INN with no BLOCK config → redacted in-process to <RU_INN>.
-func TestPII_RedactsDetectedEntity(t *testing.T) {
+// The AquaDoor-critical behavior: legal-entity INN(10)/OGRN(13) are business data, NOT 152-ФЗ
+// personal data — they are the payload of tender/dealer chat and MUST pass through untouched.
+func TestPII_AllowsLegalEntityIdentifiers(t *testing.T) {
 	p := plugin(nil)
-	req := chatReq("мой ИНН 7830002293 вот")
-	out, sc, err := p.PreLLMHook(nil, req)
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+	in := "поставщик ИНН 7707083893 ОГРН 1027700132195"
+	out, sc, err := p.PreLLMHook(nil, chatReq(in))
+	if err != nil || sc != nil {
+		t.Fatalf("legal-entity IDs must pass, sc=%v err=%v", sc, err)
 	}
-	if sc != nil {
-		t.Fatalf("unexpected short-circuit: %+v", sc)
-	}
-	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != "мой ИНН <RU_INN> вот" {
-		t.Errorf("not redacted: %q", got)
+	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != in {
+		t.Errorf("legal-entity IDs must be untouched, got %q", got)
 	}
 }
 
-// A random 10-digit number that FAILS the INN checksum must NOT be detected as an INN (the
-// checksum is the gate, not the regex) — and with no passport context it is not a passport either.
+// Individual personal data (12-digit INN, phone) is redacted before egress.
+func TestPII_RedactsIndividualPII(t *testing.T) {
+	p := plugin(nil)
+	out, sc, err := p.PreLLMHook(nil, chatReq("мой ИНН 500100732259 тел +7 999 123 45 67"))
+	if err != nil || sc != nil {
+		t.Fatalf("unexpected block/err: sc=%v err=%v", sc, err)
+	}
+	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != "мой ИНН <RU_INN> тел <RU_PHONE>" {
+		t.Errorf("individual PII not redacted: %q", got)
+	}
+}
+
+// A random 10-digit number that FAILS the INN checksum is not flagged (checksum is the gate).
 func TestPII_ChecksumGate_RandomNumberNotRedacted(t *testing.T) {
 	p := plugin(nil)
-	req := chatReq("заказ 1234567890 готов")
-	out, sc, err := p.PreLLMHook(nil, req)
+	out, sc, err := p.PreLLMHook(nil, chatReq("заказ 1234567890 готов"))
 	if err != nil || sc != nil {
 		t.Fatalf("expected passthrough, sc=%v err=%v", sc, err)
 	}
@@ -56,31 +74,29 @@ func TestPII_ChecksumGate_RandomNumberNotRedacted(t *testing.T) {
 	}
 }
 
+// A type configured to "block" refuses the whole request (fail-closed).
 func TestPII_BlocksConfiguredEntity(t *testing.T) {
-	p := plugin(map[string]bool{"RU_INN": true})
-	// A valid INN is a BLOCK entity → the whole request is refused (fail-closed).
-	_, sc, _ := p.PreLLMHook(nil, chatReq("ИНН 7830002293"))
+	p := plugin(map[string]string{entityPhone: actionBlock})
+	_, sc, _ := p.PreLLMHook(nil, chatReq("тел +7 999 123 45 67"))
 	if sc == nil || sc.Error == nil {
-		t.Fatal("expected a block for the configured BLOCK entity")
+		t.Fatal("expected a block for the block-configured entity")
 	}
 	if sc.Error.Error == nil || sc.Error.Error.Code == nil || *sc.Error.Error.Code != "pii_blocked" {
 		t.Errorf("expected code=pii_blocked, got %+v", sc.Error.Error)
 	}
 }
 
-// Passport is context-gated: a bare 10-digit-shaped number with NO passport context is not flagged
-// (avoids redacting every order number), but WITH context it is a blocked passport.
+// Passport is context-gated: no passport context → not flagged; with context → redacted.
 func TestPII_Passport_ContextGated(t *testing.T) {
-	block := map[string]bool{"RU_PASSPORT": true}
-	// No context → not detected → passes through.
-	if _, sc, _ := plugin(block).PreLLMHook(nil, chatReq("номер 12 34 567890")); sc != nil {
-		t.Fatalf("bare number without passport context must not block, got %+v", sc)
+	if _, sc, _ := plugin(nil).PreLLMHook(nil, chatReq("номер 12 34 567890")); sc != nil {
+		t.Fatalf("bare number without passport context must not fire, got %+v", sc)
 	}
-	// With context → blocked.
-	_, sc, _ := plugin(block).PreLLMHook(nil, chatReq("паспорт серия 12 34 567890"))
-	if sc == nil || sc.Error == nil || sc.Error.Error == nil || sc.Error.Error.Code == nil ||
-		*sc.Error.Error.Code != "pii_blocked" {
-		t.Fatalf("passport with context must block, got %+v", sc)
+	out, sc, err := plugin(nil).PreLLMHook(nil, chatReq("паспорт серия 12 34 567890"))
+	if err != nil || sc != nil {
+		t.Fatalf("passport should redact (default), got sc=%v err=%v", sc, err)
+	}
+	if got := *out.ChatRequest.Input[0].Content.ContentStr; got != "паспорт серия <RU_PASSPORT>" {
+		t.Errorf("passport not redacted: %q", got)
 	}
 }
 
@@ -96,20 +112,20 @@ func TestPII_PassthroughWhenNoEntities(t *testing.T) {
 	}
 }
 
-// The RAG embedding path MUST be redacted, never blocked (#1780 review) — even for a BLOCK-listed
-// entity, the embedding path only ever redacts (blocking config applies to chat/completion).
-func TestPII_RedactsEmbeddingInput(t *testing.T) {
-	p := plugin(nil)
+// The RAG embedding path is redacted, never blocked — even for a block-configured entity, the
+// embedding degrades block→redact (a blocked embedding would silently break retrieval).
+func TestPII_EmbeddingNeverBlocked(t *testing.T) {
+	p := plugin(map[string]string{entityPhone: actionBlock})
 	req := &schemas.BifrostRequest{
 		EmbeddingRequest: &schemas.BifrostEmbeddingRequest{
-			Input: &schemas.EmbeddingInput{Text: schemas.Ptr("мой ИНН 7830002293 тут")},
+			Input: &schemas.EmbeddingInput{Text: schemas.Ptr("контакт +7 999 123 45 67")},
 		},
 	}
 	out, sc, err := p.PreLLMHook(nil, req)
 	if err != nil || sc != nil {
 		t.Fatalf("embedding must be redacted, not blocked: sc=%v err=%v", sc, err)
 	}
-	if got := *out.EmbeddingRequest.Input.Text; got != "мой ИНН <RU_INN> тут" {
+	if got := *out.EmbeddingRequest.Input.Text; got != "контакт <RU_PHONE>" {
 		t.Errorf("embedding text not redacted: %q", got)
 	}
 }
@@ -118,20 +134,19 @@ func TestPII_RedactsImageGenPrompt(t *testing.T) {
 	p := plugin(nil)
 	req := &schemas.BifrostRequest{
 		ImageGenerationRequest: &schemas.BifrostImageGenerationRequest{
-			Input: &schemas.ImageGenerationInput{Prompt: "портрет ИНН 7830002293"},
+			Input: &schemas.ImageGenerationInput{Prompt: "портрет тел +7 999 123 45 67"},
 		},
 	}
 	out, sc, err := p.PreLLMHook(nil, req)
 	if err != nil || sc != nil {
 		t.Fatalf("image-gen prompt must be redacted, not blocked: sc=%v err=%v", sc, err)
 	}
-	if got := out.ImageGenerationRequest.Input.Prompt; got != "портрет ИНН <RU_INN>" {
+	if got := out.ImageGenerationRequest.Input.Prompt; got != "портрет тел <RU_PHONE>" {
 		t.Errorf("image prompt not redacted: %q", got)
 	}
 }
 
-// A prompt-bearing shape collectTextSpans doesn't cover must fail closed (block), not silently
-// forward un-redacted (the #1780-review fail-OPEN).
+// A prompt-bearing shape collectTextSpans doesn't cover must fail closed (block).
 func TestPII_BlocksUnsupportedShape(t *testing.T) {
 	p := plugin(nil)
 	req := &schemas.BifrostRequest{RerankRequest: &schemas.BifrostRerankRequest{}}
@@ -153,12 +168,23 @@ func TestPII_BlocksRawPassthrough(t *testing.T) {
 	p := plugin(nil)
 	bctx := schemas.NewBifrostContextWithValue(context.Background(), time.Time{}, "seed", "x")
 	bctx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, true)
-	_, sc, err := p.PreLLMHook(bctx, chatReq("мой ИНН 7830002293"))
+	_, sc, err := p.PreLLMHook(bctx, chatReq("мой ИНН 500100732259"))
 	if err != nil {
 		t.Fatalf("must not return a bare error: %v", err)
 	}
 	if sc == nil || sc.Error == nil || sc.Error.Error == nil || sc.Error.Error.Code == nil ||
 		*sc.Error.Error.Code != "pii_raw_passthrough_unredactable" {
 		t.Fatalf("expected a fail-closed block on raw passthrough, got %+v", sc)
+	}
+}
+
+// actionFor: unknown action value falls back to redact (never silently allow).
+func TestActionFor_UnknownFallsBackToRedact(t *testing.T) {
+	p := New(Config{Actions: map[string]string{entityPhone: "bogus"}})
+	if got := p.actionFor(entityPhone); got != actionRedact {
+		t.Errorf("unknown action must fall back to redact, got %q", got)
+	}
+	if got := p.actionFor("RU_UNLISTED"); got != actionRedact {
+		t.Errorf("unlisted type must default to redact, got %q", got)
 	}
 }
