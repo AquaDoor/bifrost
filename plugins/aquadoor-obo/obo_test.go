@@ -143,6 +143,14 @@ func TestGetRunnerToken_CachesPerEmail(t *testing.T) {
 	if !audit.CacheHit {
 		t.Error("second call should be a cache hit")
 	}
+	// #1804: a cache hit MUST still carry the resolved UserID (cached alongside the token) — the
+	// gateway identity assertion binds to it, and an empty UserID would fail-close the assertion.
+	if audit.UserID != "user-77" {
+		t.Errorf("cache-hit audit must carry UserID, got %q", audit.UserID)
+	}
+	if audit.Email != "u@aquadoor.dev" {
+		t.Errorf("cache-hit audit must carry Email, got %q", audit.Email)
+	}
 	if atomic.LoadInt32(&m.exchange) != 1 {
 		t.Errorf("expected 1 exchange (cached), got %d", m.exchange)
 	}

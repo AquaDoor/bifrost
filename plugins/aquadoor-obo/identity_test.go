@@ -167,6 +167,33 @@ func TestOboPlugin_InjectsIdentityAssertionBoundToSub(t *testing.T) {
 	}
 }
 
+// Regression (#1804): the assertion must be injected on a CACHE-HIT call too. The first call mints +
+// caches the exchange; the second serves it from cache. Before the fix the cache-hit AuditRecord had
+// an empty UserID, so BuildIdentityAssertion failed "needs both sub and email" and fail-closed the
+// whole tool call — exactly the live failure. Both calls must carry a sub-bound assertion.
+func TestOboPlugin_InjectsIdentityAssertionOnCacheHit(t *testing.T) {
+	priv, pub := testGatewayKey(t)
+	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
+	svc := identitySvc(t, m, priv)
+	p := NewPlugin(svc, []string{"aquadoor-runner"}, mockResolver{email: "u@aquadoor.dev"}, nil)
+
+	for i, label := range []string{"fresh-mint", "cache-hit"} {
+		ctx := mkCtx("sk-bf-user")
+		_, sc, err := p.PreMCPHook(ctx, &schemas.BifrostMCPRequest{ClientName: "aquadoor-runner", RequestType: schemas.MCPRequestTypeExecuteTool})
+		if err != nil || sc != nil {
+			t.Fatalf("%s: unexpected block/err: sc=%v err=%v", label, sc, err)
+		}
+		assertion := injectedHeader(ctx, "X-Aquadoor-Gateway-Identity")
+		if assertion == "" {
+			t.Fatalf("%s: assertion not injected (call %d)", label, i)
+		}
+		c := parseIdentity(t, assertion, pub)
+		if c["sub"] != "user-77" || c["email"] != "u@aquadoor.dev" {
+			t.Errorf("%s: bad assertion claims: %v", label, c)
+		}
+	}
+}
+
 func TestOboPlugin_NoIdentityAssertionWhenKeyUnset(t *testing.T) {
 	m := newMockZitadel(t, []map[string]any{{"id": "user-77"}})
 	svc := testService(t, m, StrategyImpersonation) // no IdentityPrivateKey

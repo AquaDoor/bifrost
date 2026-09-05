@@ -24,6 +24,11 @@ type AuditRecord struct {
 type cacheEntry struct {
 	value  string
 	expiry time.Time
+	// userID is the resolved Zitadel user id, cached ALONGSIDE the exchanged token (exchangeCache only;
+	// unused by userIDCache). It must survive a cache hit so the gateway identity assertion can bind to
+	// the impersonated sub even when the token is served from cache (#1804 — a cache hit previously
+	// returned an AuditRecord with an empty UserID, which fail-closed the assertion).
+	userID string
 }
 
 // Service mints + caches runner-trusted Zitadel tokens (port of obo.py OboTokenService).
@@ -291,28 +296,30 @@ func (s *Service) emailLock(email string) *sync.Mutex {
 	return l
 }
 
-func (s *Service) cachedExchange(email string, now time.Time) (string, bool) {
+// cachedExchange returns the cached exchanged token AND the resolved userID stored with it (both are
+// needed on a cache hit: the token as the runner Authorization, the userID as the assertion sub).
+func (s *Service) cachedExchange(email string, now time.Time) (string, string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.exchangeCache[email]
 	if ok && e.expiry.Add(-s.cfg.TokenSkew).After(now) {
-		return e.value, true
+		return e.value, e.userID, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // GetRunnerToken mints (or returns cached) a runner-trusted token for email via RFC-8693.
 func (s *Service) GetRunnerToken(ctx context.Context, email, inbound string) (string, AuditRecord, error) {
 	now := s.now()
-	if tok, ok := s.cachedExchange(email, now); ok {
-		return tok, AuditRecord{Email: email, Strategy: s.cfg.Strategy, CacheHit: true}, nil
+	if tok, uid, ok := s.cachedExchange(email, now); ok {
+		return tok, AuditRecord{Email: email, UserID: uid, Strategy: s.cfg.Strategy, CacheHit: true}, nil
 	}
 	lock := s.emailLock(email)
 	lock.Lock()
 	defer lock.Unlock()
 	now = s.now()
-	if tok, ok := s.cachedExchange(email, now); ok {
-		return tok, AuditRecord{Email: email, Strategy: s.cfg.Strategy, CacheHit: true}, nil
+	if tok, uid, ok := s.cachedExchange(email, now); ok {
+		return tok, AuditRecord{Email: email, UserID: uid, Strategy: s.cfg.Strategy, CacheHit: true}, nil
 	}
 
 	subjectToken, subjectType, userID, err := s.subject(ctx, email, inbound)
@@ -347,7 +354,7 @@ func (s *Service) GetRunnerToken(ctx context.Context, email, inbound string) (st
 		fallback = time.Duration(ei) * time.Second
 	}
 	s.mu.Lock()
-	s.exchangeCache[email] = cacheEntry{value: tok, expiry: tokenLifetimeExpiry(tok, now, fallback)}
+	s.exchangeCache[email] = cacheEntry{value: tok, expiry: tokenLifetimeExpiry(tok, now, fallback), userID: userID}
 	s.mu.Unlock()
 	return tok, AuditRecord{Email: email, UserID: userID, Strategy: s.cfg.Strategy, CacheHit: false}, nil
 }
