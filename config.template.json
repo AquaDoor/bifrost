@@ -1,5 +1,6 @@
 {
   "$schema": "https://www.getbifrost.ai/schema",
+  ${BIFROST_STORE_BLOCK}
   "client": {
     "drop_excess_requests": false
   },
