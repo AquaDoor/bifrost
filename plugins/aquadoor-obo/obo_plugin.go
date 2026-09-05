@@ -100,16 +100,6 @@ func (p *OboPlugin) PreMCPHook(
 	if p.logger != nil {
 		p.logger.Info("[aquadoor-obo] runner token minted: client=%s email=%s userId=%s strategy=%s cacheHit=%v",
 			req.ClientName, audit.Email, audit.UserID, audit.Strategy, audit.CacheHit)
-		// (diagnostic #1804) what extra headers are set on the context at the end of PreMCPHook?
-		if hdrs, ok := ctx.Value(schemas.BifrostContextKeyMCPExtraHeaders).(map[string][]string); ok {
-			keys := make([]string, 0, len(hdrs))
-			for k := range hdrs {
-				keys = append(keys, k)
-			}
-			p.logger.Info("[aquadoor-obo] DIAG extra-headers keys=%v identityEnabled=%v", keys, p.svc.IdentityAssertionEnabled())
-		} else {
-			p.logger.Info("[aquadoor-obo] DIAG extra-headers MISSING/wrong-type identityEnabled=%v", p.svc.IdentityAssertionEnabled())
-		}
 	}
 	return req, nil, nil
 }

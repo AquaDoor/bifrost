@@ -1,6 +1,7 @@
 {
   "$schema": "https://www.getbifrost.ai/schema",
   ${BIFROST_STORE_BLOCK}
+  "source_of_truth": "config.json",
   "client": {
     "drop_excess_requests": false
   },
@@ -29,8 +30,7 @@
       "admin_username": "env.BIFROST_ADMIN_USERNAME",
       "admin_password": "env.BIFROST_ADMIN_PASSWORD",
       "is_enabled": true
-    },
-    "virtual_keys": []
+    }
   },
   "plugins": [
     { "name": "governance", "enabled": true, "config": { "is_vk_mandatory": true } },
