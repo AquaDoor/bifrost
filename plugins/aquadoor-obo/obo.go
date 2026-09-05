@@ -33,6 +33,16 @@ const (
 
 	StrategyImpersonation = "impersonation"
 	StrategyDelegation    = "delegation"
+
+	// Gateway identity-assertion protocol constants (#1780 §7.2 / #1804 / #1798-A3). They MUST match
+	// the runner's verifyGatewayIdentity defaults (mono packages/mcp-foundation/src/gateway-identity.ts).
+	// Production threads BOTH from a single infra source (infra/src/config.ts → env) so they cannot
+	// drift across the two repos; dev/test fall back to these literals (identical on both sides).
+	DefaultIdentityIssuer   = "aquadoor-gateway"
+	DefaultIdentityAudience = "aquadoor-mcp-runner"
+	// DefaultIdentityTTL bounds the assertion's replay window. It is a per-call presenter proof, so a
+	// short life is correct (a runner call completes in well under a minute).
+	DefaultIdentityTTL = 120 * time.Second
 )
 
 // IdentityResolutionError is a fail-closed 0/many email→userId result.
@@ -60,8 +70,8 @@ type Config struct {
 	// RunnerClients are the Bifrost MCP client names that federate the AquaDoor runners — only MCP
 	// calls to these clients get an OBO token (Outline/etc. keep their own static auth). Passed to
 	// NewPlugin as the runner-client allow-set.
-	RunnerClients  []string
-	Strategy       string
+	RunnerClients []string
+	Strategy      string
 	// RunnerAudience is the runner's MCP-caps project id — the `aud` of the machine ACTOR token
 	// Bifrost presents on the runner MCP CONNECTION for tool discovery (tools/list serves any
 	// authenticated caller; per-user enforcement is on tools/call via the OBO-injected user token).
@@ -70,9 +80,32 @@ type Config struct {
 	TokenSkew      time.Duration
 	UserIDCacheTTL time.Duration
 	HTTPTimeout    time.Duration
+
+	// --- Gateway identity assertion (#1780 §7.2 / #1804 / #1798-A3) ------------------------------
+	// The OBO token-exchange DROPS every non-grant claim (metadata-sourced claims — email included —
+	// do not survive the impersonation exchange; only grant-derived caps/bundles do). So the acting
+	// user's VERIFIED email — which dekart needs as author_email for per-user map ownership — cannot
+	// ride the Zitadel token. Instead the gateway signs a minimal RS256 identity assertion carrying
+	// {iss, sub=zitadelUserId, email, aud, exp} that the runner verifies with the matching public key
+	// and binds to the OBO token's sub. It carries NO caps: authorization stays Zitadel's, minted
+	// un-inflatably by the exchange and independently re-verified at the runner, so a stolen gateway
+	// key can never inflate caps — it can only attest email for real, already-authorized users. The
+	// assertion doubles as the gateway proof-of-presenter (only the gateway holds this key), so a
+	// smuggled OBO token alone cannot satisfy an assertion-requiring runner.
+
+	// IdentityPrivateKey is the gateway RS256 private key PEM (SECRET; injected from env in
+	// plugins.go, never config.json). Empty → no assertion is minted (identity enrichment self-
+	// disabled, like the rest of OBO env).
+	IdentityPrivateKey string
+	// IdentityIssuer / IdentityAudience are the assertion's iss/aud (non-secret; config.json).
+	// Empty → DefaultIdentityIssuer / DefaultIdentityAudience.
+	IdentityIssuer   string
+	IdentityAudience string
+	// IdentityTTL bounds the assertion lifetime. <=0 → DefaultIdentityTTL.
+	IdentityTTL time.Duration
 }
 
-func (c *Config) TokenURL() string      { return strings.TrimRight(c.Issuer, "/") + "/oauth/v2/token" }
+func (c *Config) TokenURL() string { return strings.TrimRight(c.Issuer, "/") + "/oauth/v2/token" }
 func (c *Config) UserSearchURL() string {
 	return strings.TrimRight(c.Issuer, "/") + "/management/v1/users/_search"
 }
@@ -139,6 +172,59 @@ func buildClientAssertion(k ActorKey, issuer string, now time.Time, ttl time.Dur
 		"exp": now.Add(ttl).Unix(),
 	})
 	tok.Header["kid"] = k.KeyID
+	return tok.SignedString(rk)
+}
+
+// decodePEM accepts either a raw PEM string ("-----BEGIN …") or a base64-of-PEM string (how the key
+// is carried through env/compose/pulumi without newline escaping) and returns the raw PEM. This is
+// the single decode boundary so callers always work with PEM.
+func decodePEM(v string) (string, error) {
+	if strings.Contains(v, "-----BEGIN") {
+		return v, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v))
+	if err != nil {
+		return "", fmt.Errorf("key is neither PEM nor base64-of-PEM: %w", err)
+	}
+	return string(raw), nil
+}
+
+// buildIdentityAssertion signs the gateway identity assertion — a minimal RS256 JWT that delivers the
+// acting user's VERIFIED email (with the Zitadel user id as sub) to the runner. It is NOT an authz
+// token: it carries NO caps (those stay Zitadel's), only the email attribute the OBO exchange drops,
+// cryptographically bound to the same sub the OBO token authorizes. See Config's identity block.
+func buildIdentityAssertion(privKey, issuer, audience, sub, email string, now time.Time, ttl time.Duration) (string, error) {
+	if privKey == "" {
+		return "", errors.New("gateway identity private key not configured")
+	}
+	if sub == "" || email == "" {
+		return "", errors.New("gateway identity assertion needs both sub and email")
+	}
+	pemStr, err := decodePEM(privKey)
+	if err != nil {
+		return "", fmt.Errorf("gateway identity key: %w", err)
+	}
+	rk, err := parseRSAKey(pemStr)
+	if err != nil {
+		return "", fmt.Errorf("gateway identity key: %w", err)
+	}
+	if issuer == "" {
+		issuer = DefaultIdentityIssuer
+	}
+	if audience == "" {
+		audience = DefaultIdentityAudience
+	}
+	if ttl <= 0 {
+		ttl = DefaultIdentityTTL
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"iss":   issuer,
+		"sub":   sub,
+		"email": email,
+		"aud":   audience,
+		"iat":   now.Unix(),
+		"exp":   now.Add(ttl).Unix(),
+	})
 	return tok.SignedString(rk)
 }
 

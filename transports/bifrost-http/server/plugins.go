@@ -192,6 +192,12 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		if s := os.Getenv("AQUADOOR_OBO_UPSTREAM_CLIENT_SECRET"); s != "" {
 			cfg.UpstreamClientSecret = s
 		}
+		// Gateway identity assertion (#1804 / #1798-A3): the RS256 PRIVATE key is a SECRET (env, never
+		// config.json — mirrors the actor key). iss/aud come from config.json (non-secret). Empty key →
+		// no assertion is minted (identity enrichment self-disabled, like the rest of OBO env).
+		if s := os.Getenv("AQUADOOR_GATEWAY_IDENTITY_PRIVATE_KEY"); s != "" {
+			cfg.IdentityPrivateKey = s
+		}
 		timeout := cfg.HTTPTimeout
 		if timeout <= 0 {
 			timeout = 10 * time.Second

@@ -60,7 +60,9 @@
         "RunnerToolPrefixes": ["aquadoor_runner_"],
         "RunnerClients": ${AQUADOOR_OBO_RUNNER_CLIENTS},
         "RunnerAudience": "${AQUADOOR_OBO_RUNNER_AUDIENCE}",
-        "Strategy": "impersonation"
+        "Strategy": "impersonation",
+        "IdentityIssuer": "${AQUADOOR_GATEWAY_IDENTITY_ISSUER}",
+        "IdentityAudience": "${AQUADOOR_GATEWAY_IDENTITY_AUDIENCE}"
       }
     }
   ]

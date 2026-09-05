@@ -35,7 +35,7 @@ if [ -f /app/config.template.json ]; then
   # time from the canonical MCP_MODULES list (the runner federates PER-MODULE at /mcp/<slug>), so
   # the module set stays single-sourced in the mono and the fork never drifts. They substitute
   # inline as valid JSON. ${BIFROST_STORE_BLOCK} is the whole config_store+logs_store block (or empty).
-  envsubst '${AQUADOOR_LLM_BASE_URL} ${AQUADOOR_RUNNER_MCP_CLIENTS} ${AQUADOOR_OBO_RUNNER_CLIENTS} ${AQUADOOR_OBO_ISSUER} ${AQUADOOR_OBO_BACKEND_PROJECT_ID} ${AQUADOOR_OBO_UPSTREAM_CLIENT_ID} ${AQUADOOR_OBO_RUNNER_AUDIENCE} ${BIFROST_STORE_BLOCK}' \
+  envsubst '${AQUADOOR_LLM_BASE_URL} ${AQUADOOR_RUNNER_MCP_CLIENTS} ${AQUADOOR_OBO_RUNNER_CLIENTS} ${AQUADOOR_OBO_ISSUER} ${AQUADOOR_OBO_BACKEND_PROJECT_ID} ${AQUADOOR_OBO_UPSTREAM_CLIENT_ID} ${AQUADOOR_OBO_RUNNER_AUDIENCE} ${AQUADOOR_GATEWAY_IDENTITY_ISSUER} ${AQUADOOR_GATEWAY_IDENTITY_AUDIENCE} ${BIFROST_STORE_BLOCK}' \
     < /app/config.template.json > "$APP_DIR/config.json"
   echo "aquadoor-entrypoint: rendered $APP_DIR/config.json from template"
 fi

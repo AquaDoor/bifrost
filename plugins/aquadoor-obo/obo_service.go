@@ -51,8 +51,10 @@ type Service struct {
 
 type ServiceOption func(*Service)
 
-func WithSubjectProvider(p SubjectTokenProvider) ServiceOption { return func(s *Service) { s.subjectProvider = p } }
-func WithNow(fn func() time.Time) ServiceOption               { return func(s *Service) { s.now = fn } }
+func WithSubjectProvider(p SubjectTokenProvider) ServiceOption {
+	return func(s *Service) { s.subjectProvider = p }
+}
+func WithNow(fn func() time.Time) ServiceOption { return func(s *Service) { s.now = fn } }
 
 func NewService(cfg Config, hc *http.Client, opts ...ServiceOption) *Service {
 	if cfg.TokenSkew == 0 {
@@ -209,6 +211,25 @@ func (s *Service) GetRunnerConnectionToken(ctx context.Context) (string, error) 
 	return s.runnerConnToken, nil
 }
 
+// IdentityAssertionEnabled reports whether the gateway identity assertion is configured (a private
+// key was injected). When false the plugin injects no assertion — identity enrichment self-disabled.
+func (s *Service) IdentityAssertionEnabled() bool { return s.cfg.IdentityPrivateKey != "" }
+
+// BuildIdentityAssertion mints the gateway-signed identity assertion for (userID, email) — see
+// buildIdentityAssertion. userID becomes the assertion sub (the same Zitadel id the OBO token
+// authorizes), email the verified attribute the runner adopts. Uses the service clock so tests pin it.
+func (s *Service) BuildIdentityAssertion(userID, email string) (string, error) {
+	return buildIdentityAssertion(
+		s.cfg.IdentityPrivateKey,
+		s.cfg.IdentityIssuer,
+		s.cfg.IdentityAudience,
+		userID,
+		email,
+		s.now(),
+		s.cfg.IdentityTTL,
+	)
+}
+
 func (s *Service) resolveUserID(ctx context.Context, email string) (string, error) {
 	now := s.now()
 	s.mu.Lock()
@@ -303,14 +324,14 @@ func (s *Service) GetRunnerToken(ctx context.Context, email, inbound string) (st
 		return "", AuditRecord{}, err
 	}
 	form := url.Values{
-		"grant_type":         {tokenExchangeGrant},
-		"subject_token":      {subjectToken},
-		"subject_token_type": {subjectType},
-		"actor_token":        {actor},
-		"actor_token_type":   {accessTokenType},
+		"grant_type":           {tokenExchangeGrant},
+		"subject_token":        {subjectToken},
+		"subject_token_type":   {subjectType},
+		"actor_token":          {actor},
+		"actor_token_type":     {accessTokenType},
 		"requested_token_type": {jwtTokenType},
-		"audience":           {s.cfg.BackendProjectID},
-		"scope":              {"openid " + s.cfg.BackendAudScope()},
+		"audience":             {s.cfg.BackendProjectID},
+		"scope":                {"openid " + s.cfg.BackendAudScope()},
 	}
 	status, body, err := s.postForm(ctx, s.cfg.TokenURL(), form,
 		map[string]string{"Authorization": basicAuth(s.cfg.UpstreamClientID, s.cfg.UpstreamClientSecret)})

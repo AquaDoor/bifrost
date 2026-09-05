@@ -82,6 +82,19 @@ func (p *OboPlugin) PreMCPHook(
 		return req, blockMCP("obo_mint_failed", "OBO token mint failed: "+err.Error()), nil
 	}
 	injectMCPHeader(ctx, "Authorization", "Bearer "+token)
+	// Gateway identity assertion (#1780 §7.2 / #1804 / #1798-A3): deliver the acting user's VERIFIED
+	// email — which the OBO token-exchange drops — to the runner as a gateway-signed attribute, bound
+	// to the SAME Zitadel sub the OBO token authorizes (audit.UserID), and serving as the gateway
+	// proof-of-presenter. Fail-closed: if configured but signing fails, refuse the call — never send
+	// an OBO token with an unattested identity. Forwarded to the runner iff X-Aquadoor-Gateway-Identity
+	// is in the client's allowed_extra_headers (gen-bifrost-runner-clients.mjs).
+	if p.svc.IdentityAssertionEnabled() {
+		assertion, aerr := p.svc.BuildIdentityAssertion(audit.UserID, audit.Email)
+		if aerr != nil {
+			return req, blockMCP("obo_identity_failed", "gateway identity assertion failed: "+aerr.Error()), nil
+		}
+		injectMCPHeader(ctx, "X-Aquadoor-Gateway-Identity", assertion)
+	}
 	// Audit line (spec #1780 §7.8): one record per runner-token mint, so an OBO grant is traceable
 	// to the acting user + resolved Zitadel id (never the spoofable header path #1777 replaced).
 	if p.logger != nil {
