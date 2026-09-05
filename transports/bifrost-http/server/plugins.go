@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	aquadoordefaultprovider "github.com/maximhq/bifrost/plugins/aquadoor-defaultprovider"
 	aquadoorobo "github.com/maximhq/bifrost/plugins/aquadoor-obo"
 	aquadoorpii "github.com/maximhq/bifrost/plugins/aquadoor-pii"
 	"github.com/maximhq/bifrost/plugins/compat"
@@ -155,6 +156,21 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 
 	case modelcatalogresolver.PluginName:
 		return modelcatalogresolver.Init(bifrostConfig.ModelCatalog, logger)
+
+	case "aquadoor-default-provider":
+		// AquaDoor default-provider hook (#1780 §7.7 / #1801 / G006): route bare/unknown-prefix model
+		// names (LibreChat chat/RAG/memory) to the AquaDoor LLM provider so egress flows through
+		// Bifrost (pii + governance) without per-model prefixing. Config-driven ({Provider}); empty →
+		// self-disabled. MUST be registered BEFORE governance so the defaulted provider is what
+		// governance + validateRequestAfterPreRequestHooks see.
+		cfg, err := MarshalPluginConfig[aquadoordefaultprovider.Config](pluginConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal aquadoor-default-provider plugin config: %w", err)
+		}
+		if cfg == nil {
+			cfg = &aquadoordefaultprovider.Config{}
+		}
+		return aquadoordefaultprovider.New(*cfg), nil
 
 	case "aquadoor-pii":
 		// AquaDoor fail-closed RU PII egress guardrail (#1780 §7.5). In-process recognition (no

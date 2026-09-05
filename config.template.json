@@ -33,6 +33,7 @@
     }
   },
   "plugins": [
+    { "name": "aquadoor-default-provider", "enabled": true, "config": { "Provider": "aquadoor-llm" } },
     { "name": "governance", "enabled": true, "config": { "is_vk_mandatory": true } },
     {
       "name": "aquadoor-pii",
