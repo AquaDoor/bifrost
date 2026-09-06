@@ -19,6 +19,7 @@ require (
 	github.com/maximhq/bifrost/framework v1.6.0
 	github.com/maximhq/bifrost/plugins/aquadoor-obo v0.0.0
 	github.com/maximhq/bifrost/plugins/aquadoor-pii v0.0.0
+	github.com/maximhq/bifrost/plugins/aquadoor-usermeter v0.0.0
 	github.com/maximhq/bifrost/plugins/compat v0.2.0
 	github.com/maximhq/bifrost/plugins/governance v1.7.0
 	github.com/maximhq/bifrost/plugins/logging v1.7.0
@@ -251,3 +252,5 @@ replace github.com/valyala/fasthttp => github.com/maximhq/fasthttp v1.73.1
 replace github.com/maximhq/bifrost/plugins/aquadoor-obo => ../plugins/aquadoor-obo
 
 replace github.com/maximhq/bifrost/plugins/aquadoor-pii => ../plugins/aquadoor-pii
+
+replace github.com/maximhq/bifrost/plugins/aquadoor-usermeter => ../plugins/aquadoor-usermeter
