@@ -69,8 +69,7 @@ func (p *Plugin) HTTPTransportPreAuthHook(ctx *schemas.BifrostContext, req *sche
 	}
 
 	// 1. Proof-of-asserter: honor the vouched email ONLY when the caller presents the trusted VK.
-	presented, headerKey, bearer := presentedCredential(req)
-	if presented == "" || presented != p.asserterVK {
+	if presented := presentedVKValue(req); presented == "" || presented != p.asserterVK {
 		return nil, nil // not LibreChat vouching — leave the request's own credential untouched
 	}
 
@@ -100,14 +99,12 @@ func (p *Plugin) HTTPTransportPreAuthHook(ctx *schemas.BifrostContext, req *sche
 		return blockResponse(403, "no_per_user_vk", "no per-user virtual key is provisioned for this user"), nil
 	}
 
-	// 4. Swap the presented credential to the per-user VK, so identity settles on it and governance
-	//    meters this user. Rewrite the SAME header the asserter arrived on (deterministic — avoids the
-	//    x-bf-vk-vs-Authorization precedence question).
-	newCred := vkValue
-	if bearer {
-		newCred = "Bearer " + vkValue
-	}
-	setHeaderValue(req.Headers, headerKey, newCred)
+	// 4. Swap the asserter → the per-user VK in EVERY credential header that presents it, so identity
+	//    settles on the per-user VK and governance meters this user. Rewriting all asserter-bearing
+	//    headers (not just one) defends the double-VK-header ambiguity: the transport reads every VK
+	//    header last-wins (lib/ctx.go:449-476), so leaving a second header on the asserter could
+	//    re-settle the shared service VK.
+	rewriteAsserterHeaders(req.Headers, p.asserterVK, vkValue)
 	if p.logger != nil {
 		p.logger.Debug("aquadoor-usermeter: metering request per-user (email=%s)", email)
 	}
@@ -125,36 +122,40 @@ func (p *Plugin) HTTPTransportStreamChunkHook(_ *schemas.BifrostContext, _ *sche
 	return chunk, nil
 }
 
-// presentedCredential returns the VK value the request presents, the header it arrived on, and
-// whether that header is Bearer-wrapped — mirroring the transport's own recognition order
-// (x-bf-vk, then Authorization: Bearer sk-bf-…). headerKey is a lowercase canonical name;
-// setHeaderValue matches the real header case-insensitively when rewriting.
-func presentedCredential(req *schemas.HTTPRequest) (value, headerKey string, bearer bool) {
+// presentedVKValue returns the VK value the request presents — x-bf-vk first, else
+// Authorization: Bearer sk-bf-… — mirroring the transport's own recognition (lib/ctx.go). "" if none.
+func presentedVKValue(req *schemas.HTTPRequest) string {
 	if v := strings.TrimSpace(req.CaseInsensitiveHeaderLookup("x-bf-vk")); v != "" {
-		return v, "x-bf-vk", false
+		return v
 	}
 	a := strings.TrimSpace(req.CaseInsensitiveHeaderLookup("authorization"))
 	if len(a) >= 7 && strings.EqualFold(a[:7], "bearer ") {
-		if t := strings.TrimSpace(a[7:]); t != "" {
-			return t, "authorization", true
-		}
+		return strings.TrimSpace(a[7:])
 	}
-	return "", "", false
+	return ""
 }
 
-// setHeaderValue overwrites the value of an existing header (matched case-insensitively, preserving
-// its original key case so no duplicate key is introduced), or sets canonicalKey when absent.
-func setHeaderValue(headers map[string]string, canonicalKey, value string) {
+// rewriteAsserterHeaders replaces the asserter VK with the per-user VK in EVERY credential header
+// that currently presents the asserter, preserving each header's format (Bearer for Authorization,
+// raw otherwise) and its original key case (rewrites in place — no duplicate key). Only headers
+// carrying the asserter are touched; an unrelated Authorization/api-key value is left alone.
+func rewriteAsserterHeaders(headers map[string]string, asserter, vkValue string) {
 	if headers == nil {
 		return
 	}
-	for k := range headers {
-		if strings.EqualFold(k, canonicalKey) {
-			headers[k] = value
-			return
+	for k, v := range headers {
+		switch strings.ToLower(k) {
+		case "x-bf-vk", "x-api-key", "x-goog-api-key", "api-key":
+			if strings.TrimSpace(v) == asserter {
+				headers[k] = vkValue
+			}
+		case "authorization":
+			a := strings.TrimSpace(v)
+			if len(a) >= 7 && strings.EqualFold(a[:7], "bearer ") && strings.TrimSpace(a[7:]) == asserter {
+				headers[k] = "Bearer " + vkValue
+			}
 		}
 	}
-	headers[canonicalKey] = value
 }
 
 // decodeEmailHeader unwraps LibreChat's `b64:<base64>` non-ASCII header encoding. Plain ASCII emails

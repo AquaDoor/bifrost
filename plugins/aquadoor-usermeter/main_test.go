@@ -152,6 +152,28 @@ func TestPreAuth_SelfDisabled_WhenAsserterUnset(t *testing.T) {
 	}
 }
 
+func TestPreAuth_DoubleAsserterHeaders_BothRewritten(t *testing.T) {
+	// Defensive (M3): if the asserter is presented in BOTH x-bf-vk and Authorization, both must be
+	// swapped to the per-user VK — leaving either on the asserter could let the transport (last-wins
+	// over all VK headers) re-settle the shared service VK.
+	p := New(Config{AsserterVK: svcVK}, storeWith(map[string]string{"user@aquadoor.dev": "sk-bf-user-123"}), nil)
+	r := req(map[string]string{
+		"x-bf-vk":               svcVK,
+		"Authorization":         "Bearer " + svcVK,
+		"X-Aquadoor-User-Email": "user@aquadoor.dev",
+	})
+	resp, err := p.HTTPTransportPreAuthHook(&schemas.BifrostContext{}, r)
+	if resp != nil || err != nil {
+		t.Fatalf("expected continue, got resp=%v err=%v", resp, err)
+	}
+	if r.Headers["x-bf-vk"] != "sk-bf-user-123" {
+		t.Fatalf("x-bf-vk not swapped: %q", r.Headers["x-bf-vk"])
+	}
+	if r.Headers["Authorization"] != "Bearer sk-bf-user-123" {
+		t.Fatalf("Authorization not swapped: %q — leaves the service VK settleable", r.Headers["Authorization"])
+	}
+}
+
 func TestPreAuth_LowercaseAuthorizationHeader_RewrittenInPlace(t *testing.T) {
 	p := New(Config{AsserterVK: svcVK}, storeWith(map[string]string{"user@aquadoor.dev": "sk-bf-user-123"}), nil)
 	// HTTP/2 clients lowercase header names.
