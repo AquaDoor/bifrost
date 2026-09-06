@@ -163,6 +163,48 @@ func TestPII_BlocksUnsupportedShape(t *testing.T) {
 	}
 }
 
+// #1813: a content-bearing shape the OLD deny-list did NOT enumerate (e.g. file-upload) used to pass
+// un-redacted (fail-OPEN). The allow-list must now block it.
+func TestPII_BlocksUnenumeratedContentShape(t *testing.T) {
+	p := plugin(nil)
+	req := &schemas.BifrostRequest{FileUploadRequest: &schemas.BifrostFileUploadRequest{}}
+	_, sc, err := p.PreLLMHook(nil, req)
+	if err != nil {
+		t.Fatalf("must not return a bare error: %v", err)
+	}
+	if sc == nil || sc.Error == nil || sc.Error.Error == nil || sc.Error.Error.Code == nil ||
+		*sc.Error.Error.Code != "pii_unsupported_shape" {
+		t.Fatalf("expected a fail-closed block for a previously-unenumerated content shape, got %+v", sc)
+	}
+}
+
+// #1813: a request with NO recognized shape (a new/unknown Bifrost request type) must fail closed.
+func TestPII_BlocksUnknownEmptyShape(t *testing.T) {
+	p := plugin(nil)
+	_, sc, err := p.PreLLMHook(nil, &schemas.BifrostRequest{})
+	if err != nil {
+		t.Fatalf("must not return a bare error: %v", err)
+	}
+	if sc == nil || sc.Error == nil || sc.Error.Error == nil || sc.Error.Error.Code == nil ||
+		*sc.Error.Error.Code != "pii_unsupported_shape" {
+		t.Fatalf("expected a fail-closed block for an unrecognized shape, got %+v", sc)
+	}
+}
+
+// #1813: a content-free operational op (no user text egresses) must pass — neither blocked nor a
+// redaction attempt.
+func TestPII_AllowsContentFreeOp(t *testing.T) {
+	p := plugin(nil)
+	req := &schemas.BifrostRequest{ListModelsRequest: &schemas.BifrostListModelsRequest{}}
+	out, sc, err := p.PreLLMHook(nil, req)
+	if err != nil || sc != nil {
+		t.Fatalf("content-free op must pass (not block): sc=%v err=%v", sc, err)
+	}
+	if out == nil {
+		t.Fatal("expected the request to pass through unchanged")
+	}
+}
+
 // A raw request-body passthrough egresses the ORIGINAL bytes span redaction never touches; block it.
 func TestPII_BlocksRawPassthrough(t *testing.T) {
 	p := plugin(nil)

@@ -105,15 +105,22 @@ func (p *Plugin) PreLLMHook(
 				"raw request-body passthrough egresses un-redacted bytes; blocked (fail-closed)"), nil
 		}
 	}
-	// Fail-closed #2 — a prompt/content-bearing request shape this guardrail does not redact. Chat,
-	// text-completion, embedding (RAG) and image-generation ARE covered by collectTextSpans below;
-	// every other content-bearing shape would otherwise egress un-redacted (silent fail-OPEN, #1780
-	// review). Block it loudly rather than leak. Extend collectTextSpans + unsupportedShape together
-	// as B7 adds coverage.
-	if shape := unsupportedShape(req); shape != "" {
+	// Fail-closed #2 — ALLOW-LIST (block-by-default, #1813). Only chat / text-completion / embedding /
+	// image-generation are inspected + redacted (collectTextSpans below). Content-free metadata ops
+	// (list / retrieve / delete / cancel) egress no user text and pass. EVERY other content-bearing
+	// shape — AND any NEW/unrecognized shape a Bifrost upgrade adds — is BLOCKED, not silently leaked.
+	// This replaced a deny-list that failed OPEN on any shape it did not enumerate (a new content-
+	// bearing request type would have egressed un-redacted). Non-text PII inside a COVERED shape (an
+	// image content-block in a chat message, an image in image-generation) is the documented accepted
+	// residual (#1813 followup). Extend collectTextSpans + move a shape to piiRedact as B7 covers it.
+	switch requestDisposition(req) {
+	case piiBlock:
 		return req, blockShortCircuit("pii_unsupported_shape",
-			"PII guardrail cannot redact a "+shape+" request; blocked (fail-closed)"), nil
+			"PII guardrail cannot inspect this request shape; blocked (fail-closed)"), nil
+	case piiAllow:
+		return req, nil, nil // content-free operational request — no user text egresses
 	}
+	// piiRedact — a covered content-bearing shape; fall through to span redaction below.
 	// A RAG embedding is NEVER blocked (§7.5 review — a blocked embedding would silently break
 	// retrieval); a block-action entity is redacted instead on that path.
 	blockAllowed := req.EmbeddingRequest == nil
@@ -167,37 +174,73 @@ func blockShortCircuit(code, msg string) *schemas.LLMPluginShortCircuit {
 	}
 }
 
-// unsupportedShape names a prompt/content-bearing request shape this guardrail does NOT redact (so
-// PreLLMHook must fail closed), or "" when the request is either fully covered by collectTextSpans
-// (chat, text-completion, embedding, image-generation) or is a content-free operational request
-// (list-models, responses retrieve/delete/cancel/input-items, video retrieve/download, image
-// variation) that egresses no user PII text. The blocked shapes carry user text/content off-shore
-// that this text guardrail cannot yet inspect — a loud block is the fail-closed choice over a
-// silent leak. Extend collectTextSpans + this switch together as B7 adds coverage.
-func unsupportedShape(req *schemas.BifrostRequest) string {
+// piiDisposition is how the guardrail treats a request shape. The zero value is piiBlock, so any
+// code path that forgets to classify a shape fails CLOSED by construction.
+type piiDisposition int
+
+const (
+	piiBlock  piiDisposition = iota // fail-closed default: content-bearing-uninspected OR unknown
+	piiRedact                       // covered content-bearing shape → collectTextSpans redacts it
+	piiAllow                        // content-free operational shape → no user text egresses
+)
+
+// requestDisposition classifies a request for the PII guardrail as an ALLOW-LIST (block-by-default,
+// #1813). It replaced a deny-list that returned "allow" for every shape it did not enumerate — so a
+// content-bearing request type NOT on that list (FileUpload, VideoRemix, CachedContent create/update,
+// Batch/Container create, raw Passthrough, …) OR any NEW shape a Bifrost upgrade adds egressed
+// un-redacted (silent fail-OPEN). Now:
+//   - piiRedact: chat / text-completion / embedding / image-generation — collectTextSpans redacts.
+//   - piiAllow: content-free ops (list / retrieve / delete / cancel / input-items / results /
+//     download / content) — id + metadata only; no user PII text egresses.
+//   - piiBlock (default): every other content-bearing shape this text guardrail cannot inspect
+//     (responses-create, count-tokens, compaction, rerank, ocr, speech, transcription, image-edit,
+//     image-variation, video generation/edit/remix, file/container-file upload, cached-content
+//     create/update, batch/container create, passthrough) AND any unrecognized/new shape → blocked
+//     loudly rather than leaked. NON-TEXT PII inside a covered shape (image content-blocks, the
+//     image-generation image output) is the documented accepted residual (#1813 followup).
+//
+// As B7 adds coverage, extend collectTextSpans and move the shape from the default into piiRedact.
+func requestDisposition(req *schemas.BifrostRequest) piiDisposition {
 	switch {
-	case req.ResponsesRequest != nil:
-		return "responses"
-	case req.CountTokensRequest != nil:
-		return "count-tokens"
-	case req.RerankRequest != nil:
-		return "rerank"
-	case req.SpeechRequest != nil:
-		return "speech"
-	case req.TranscriptionRequest != nil:
-		return "transcription"
-	case req.ImageEditRequest != nil:
-		return "image-edit"
-	case req.VideoGenerationRequest != nil:
-		return "video-generation"
-	case req.VideoEditRequest != nil:
-		return "video-edit"
-	case req.OCRRequest != nil:
-		return "ocr"
-	case req.CompactionRequest != nil:
-		return "compaction"
+	case req.ChatRequest != nil,
+		req.TextCompletionRequest != nil,
+		req.EmbeddingRequest != nil,
+		req.ImageGenerationRequest != nil:
+		return piiRedact
+
+	case req.ListModelsRequest != nil,
+		req.ResponsesRetrieveRequest != nil,
+		req.ResponsesDeleteRequest != nil,
+		req.ResponsesCancelRequest != nil,
+		req.ResponsesInputItemsRequest != nil,
+		req.VideoRetrieveRequest != nil,
+		req.VideoDownloadRequest != nil,
+		req.VideoListRequest != nil,
+		req.VideoDeleteRequest != nil,
+		req.FileListRequest != nil,
+		req.FileRetrieveRequest != nil,
+		req.FileDeleteRequest != nil,
+		req.FileContentRequest != nil,
+		req.CachedContentListRequest != nil,
+		req.CachedContentRetrieveRequest != nil,
+		req.CachedContentDeleteRequest != nil,
+		req.BatchListRequest != nil,
+		req.BatchRetrieveRequest != nil,
+		req.BatchCancelRequest != nil,
+		req.BatchResultsRequest != nil,
+		req.BatchDeleteRequest != nil,
+		req.ContainerListRequest != nil,
+		req.ContainerRetrieveRequest != nil,
+		req.ContainerDeleteRequest != nil,
+		req.ContainerFileListRequest != nil,
+		req.ContainerFileRetrieveRequest != nil,
+		req.ContainerFileContentRequest != nil,
+		req.ContainerFileDeleteRequest != nil:
+		return piiAllow
+
+	default:
+		return piiBlock
 	}
-	return ""
 }
 
 // textSpan is a mutable handle to one outbound text field.
