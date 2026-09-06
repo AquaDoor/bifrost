@@ -3747,6 +3747,23 @@ func (s *RDBConfigStore) GetVirtualKey(ctx context.Context, id string) (*tables.
 	return &virtualKey, nil
 }
 
+// GetVirtualKeyByName retrieves a virtual key by its unique `name` handle. AquaDoor sets the VK
+// name to the owner's lowercased email (the aquadoor-usermeter plugin resolves a LibreChat-vouched
+// end-user email to that user's VK value so governance meters per user). `name` carries a unique
+// index (governance_virtual_keys), so this is a single indexed row read — unlike GetVirtualKeys,
+// which is a full paginated startup load and must never sit on a request hot path.
+func (s *RDBConfigStore) GetVirtualKeyByName(ctx context.Context, name string) (*tables.TableVirtualKey, error) {
+	var virtualKey tables.TableVirtualKey
+	q := preloadVirtualKeyDetailRelations(s.ScopedDB(ctx))
+	if err := q.First(&virtualKey, "governance_virtual_keys.name = ?", name).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &virtualKey, nil
+}
+
 // findVirtualKeyByValue resolves a virtual key from a presented value: the
 // current value hash first, then a rotation-grace previous value hash that is
 // still inside its window, then the plaintext fallback for rows not yet
