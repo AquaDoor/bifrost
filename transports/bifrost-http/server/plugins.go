@@ -229,18 +229,27 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		// come from config.json; the trusted-asserter VK (the LibreChat service VK) is a SECRET → env,
 		// never config.json (mirrors aquadoor-obo). Empty asserter or no config store → self-disabled
 		// (pass-through). email→VK resolution uses the config store's by-name lookup.
-		cfg, err := MarshalPluginConfig[aquadoorusermeter.Config](pluginConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal aquadoor-usermeter plugin config: %w", err)
-		}
-		if cfg == nil {
-			cfg = &aquadoorusermeter.Config{}
+		// This plugin is gated ON by env (the asserter VK), NOT by a config.json PluginConfigs entry,
+		// so pluginConfig is normally nil. MarshalPluginConfig(nil) errors ("invalid config type"), so
+		// only marshal when a non-secret config block is actually present; otherwise start from defaults.
+		cfg := &aquadoorusermeter.Config{}
+		if pluginConfig != nil {
+			parsed, err := MarshalPluginConfig[aquadoorusermeter.Config](pluginConfig)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal aquadoor-usermeter plugin config: %w", err)
+			}
+			if parsed != nil {
+				cfg = parsed
+			}
 		}
 		if v := os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK"); v != "" {
 			cfg.AsserterVK = v
 		}
 		// The RDB config store implements GetVirtualKeyByName; a nil/other store → New self-disables.
-		store, _ := bifrostConfig.ConfigStore.(aquadoorusermeter.VKStore)
+		store, ok := bifrostConfig.ConfigStore.(aquadoorusermeter.VKStore)
+		if !ok && cfg.AsserterVK != "" {
+			logger.Warn("aquadoor-usermeter: config store has no GetVirtualKeyByName — plugin is INERT despite the asserter being set (per-user metering OFF)")
+		}
 		return aquadoorusermeter.New(*cfg, store, logger), nil
 
 	default:
