@@ -223,15 +223,14 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		return aquadoorobo.NewPlugin(svc, cfg.RunnerClients, aquadoorobo.GovernanceVKNameResolver{}, logger), nil
 
 	case aquadoorusermeter.PluginName:
-		// AquaDoor per-user LLM cost metering (#1814). In HTTPTransportPreAuthHook it swaps a
-		// LibreChat-vouched end-user email (X-Aquadoor-User-Email) to that user's per-user VK so
-		// governance meters cost/budget/rate PER USER. Non-secret config (EmailHeader, CacheTTL) may
-		// come from config.json; the trusted-asserter VK (the LibreChat service VK) is a SECRET → env,
-		// never config.json (mirrors aquadoor-obo). Empty asserter or no config store → self-disabled
-		// (pass-through). email→VK resolution uses the config store's by-name lookup.
-		// This plugin is gated ON by env (the asserter VK), NOT by a config.json PluginConfigs entry,
-		// so pluginConfig is normally nil. MarshalPluginConfig(nil) errors ("invalid config type"), so
-		// only marshal when a non-secret config block is actually present; otherwise start from defaults.
+		// AquaDoor per-user cost ATTRIBUTION (#1814). In HTTPTransportPreHook (after auth) it stamps a
+		// LibreChat-vouched end-user email (X-Aquadoor-User-Email) as the request's Bifrost user
+		// identity so the logging plugin records cost PER USER (the `user` dimension). It NEVER swaps
+		// the credential — the service VK is kept, so routing/keys/budget/rate are untouched and it can
+		// never break a request. The trusted-asserter VK (the LibreChat service VK) is a SECRET → env,
+		// never config.json (mirrors aquadoor-obo); empty → self-disabled. This plugin is gated ON by
+		// env, NOT a config.json PluginConfigs entry, so pluginConfig is normally nil — only marshal a
+		// non-secret config block when one is actually present (MarshalPluginConfig(nil) errors).
 		cfg := &aquadoorusermeter.Config{}
 		if pluginConfig != nil {
 			parsed, err := MarshalPluginConfig[aquadoorusermeter.Config](pluginConfig)
@@ -245,12 +244,7 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		if v := os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK"); v != "" {
 			cfg.AsserterVK = v
 		}
-		// The RDB config store implements GetVirtualKeyByName; a nil/other store → New self-disables.
-		store, ok := bifrostConfig.ConfigStore.(aquadoorusermeter.VKStore)
-		if !ok && cfg.AsserterVK != "" {
-			logger.Warn("aquadoor-usermeter: config store has no GetVirtualKeyByName — plugin is INERT despite the asserter being set (per-user metering OFF)")
-		}
-		return aquadoorusermeter.New(*cfg, store, logger), nil
+		return aquadoorusermeter.New(*cfg, logger), nil
 
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
@@ -449,7 +443,7 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	// set AND a config store is present (email→VK resolution needs it) — so pre-cutover boots run
 	// pure pass-through. As a PreAuth hook it runs before every PreRequest/PreLLM hook, so its order
 	// relative to governance (4) is irrelevant to correctness; ordered last among builtins.
-	if os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK") != "" && s.Config.ConfigStore != nil {
+	if os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK") != "" {
 		umPluginConfig := s.getPluginConfig("aquadoor-usermeter")
 		var umCfg any
 		if umPluginConfig != nil {
@@ -458,7 +452,7 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 		s.registerPluginWithStatus(ctx, "aquadoor-usermeter", nil, umCfg, false)
 	} else {
 		s.markPluginDisabled("aquadoor-usermeter")
-		logger.Info("aquadoor-usermeter disabled — set AQUADOOR_USERMETER_ASSERTER_VK (+ a config store) to enable per-user LLM cost metering")
+		logger.Info("aquadoor-usermeter disabled — set AQUADOOR_USERMETER_ASSERTER_VK to enable per-user cost attribution")
 	}
 	s.Config.SetPluginOrderInfo("aquadoor-usermeter", builtinPlacement, schemas.Ptr(12))
 
