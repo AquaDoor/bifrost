@@ -136,7 +136,6 @@ var builtinPluginNames = []string{
 	// AquaDoor in-tree plugins (#1780) — string literals; these packages export no PluginName const.
 	"aquadoor-pii",
 	"aquadoor-obo",
-	"aquadoor-usermeter",
 }
 
 func GetBuiltinPluginNames() []string {

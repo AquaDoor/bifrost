@@ -14,7 +14,6 @@ import (
 	aquadoordefaultprovider "github.com/maximhq/bifrost/plugins/aquadoor-defaultprovider"
 	aquadoorobo "github.com/maximhq/bifrost/plugins/aquadoor-obo"
 	aquadoorpii "github.com/maximhq/bifrost/plugins/aquadoor-pii"
-	aquadoorusermeter "github.com/maximhq/bifrost/plugins/aquadoor-usermeter"
 	"github.com/maximhq/bifrost/plugins/compat"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/logging"
@@ -222,67 +221,10 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		svc := aquadoorobo.NewService(*cfg, &http.Client{Timeout: timeout})
 		return aquadoorobo.NewPlugin(svc, cfg.RunnerClients, aquadoorobo.GovernanceVKNameResolver{}, logger), nil
 
-	case aquadoorusermeter.PluginName:
-		// AquaDoor per-user cost + limits (#1814, spec §1b). In HTTPTransportPreHook (after auth) it
-		// stamps a LibreChat-vouched end-user email (X-Aquadoor-User-Email) as the request's Bifrost
-		// user identity (the `user` dimension). With AQUADOOR_USERMETER_BIND on it ALSO rewrites the
-		// request's VK header to the caller's per-user VK, so Bifrost meters cost AND enforces that VK's
-		// budget/rate — the SSOT path — failing closed on an unresolvable VK; off (the dark default) it
-		// is attribution-only and keeps the service VK, so routing cannot break. The trusted-asserter VK
-		// (the LibreChat service VK) is a SECRET → env, never config.json (mirrors aquadoor-obo); empty
-		// → self-disabled. This plugin is gated ON by env, NOT a config.json PluginConfigs entry, so
-		// pluginConfig is normally nil — only marshal a non-secret config block when one is actually
-		// present (MarshalPluginConfig(nil) errors).
-		cfg := &aquadoorusermeter.Config{}
-		if pluginConfig != nil {
-			parsed, err := MarshalPluginConfig[aquadoorusermeter.Config](pluginConfig)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal aquadoor-usermeter plugin config: %w", err)
-			}
-			if parsed != nil {
-				cfg = parsed
-			}
-		}
-		if v := os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK"); v != "" {
-			cfg.AsserterVK = v
-		}
-		// Bind flag (spec §1b): dark by default; flipped at the tested Stage-4 cutover.
-		if v := os.Getenv("AQUADOOR_USERMETER_BIND"); v == "1" || v == "true" {
-			cfg.Bind = true
-		}
-		// Wire the email→per-user-VK resolver off the governance store (the SSOT), mirroring how the
-		// routing plugin pulls the governance plugin. Wired whenever governance is present so flipping
-		// the bind flag needs no code change; only the bind path consults it. Bind without a governance
-		// plugin is a hard error — it could not resolve a VK to fail closed against.
-		var usermeterResolver aquadoorusermeter.VirtualKeyResolver
-		if gov, govErr := lib.FindPluginAs[governance.BaseGovernancePlugin](bifrostConfig, governancePluginNameFromContext(ctx)); govErr == nil {
-			usermeterResolver = governanceVKResolver{store: gov.GetGovernanceStore()}
-		} else if cfg.Bind {
-			return nil, fmt.Errorf("aquadoor-usermeter bind requires the governance plugin: %w", govErr)
-		}
-		return aquadoorusermeter.New(*cfg, usermeterResolver, logger), nil
 
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
 	}
-}
-
-// governanceVKResolver adapts the governance store to aquadoor-usermeter's VirtualKeyResolver: it maps
-// a VK NAME (the user's lowercased email) to the per-user VK VALUE governance binds. The store returns
-// the live VK with its value decrypted, so active/expiry are evaluated here and the value never leaves
-// the process. Returns found=false when no VK carries the name.
-type governanceVKResolver struct{ store governance.GovernanceStore }
-
-func (r governanceVKResolver) ResolveVKValueByName(ctx context.Context, name string) (string, bool, bool) {
-	if r.store == nil {
-		return "", false, false
-	}
-	vk, ok := r.store.GetVirtualKeyByName(ctx, name)
-	if !ok || vk == nil {
-		return "", false, false
-	}
-	active := vk.IsActiveValue() && !vk.IsExpiredAt(time.Now())
-	return vk.Value.GetValue(), active, true
 }
 
 // loadCustomPlugin loads a plugin from a shared object file
@@ -471,27 +413,10 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	}
 	s.Config.SetPluginOrderInfo("aquadoor-obo", builtinPlacement, schemas.Ptr(11))
 
-	// 13. AquaDoor per-user LLM cost ATTRIBUTION (#1814 §1a). HTTPTransportPreHook (AFTER auth) — when the
-	// caller presents the trusted asserter VK (the LibreChat service VK, this env) AND a vouched
-	// X-Aquadoor-User-Email, it stamps BifrostContextKeyUserID=email so the logging plugin records cost
-	// on the `user` dimension. It NEVER swaps the credential (the request keeps the presented service VK):
-	// no per-user VK, no email→VK store, no PreAuth swap — the VK-swap approach was abandoned (822aaa1)
-	// after it broke LLM routing. Worst case is "one request unattributed"; it early-returns (nil,nil) for
-	// any non-asserter caller — e.g. every per-user-VK MCP call — so it cannot affect routing/auth or
-	// break chat or the MCP path. Ships DARK: registers only when the asserter VK env is set; empty →
-	// pure pass-through. (Per-user LIMITS are LibreChat native Balance, not a per-user VK budget.)
-	if os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK") != "" {
-		umPluginConfig := s.getPluginConfig("aquadoor-usermeter")
-		var umCfg any
-		if umPluginConfig != nil {
-			umCfg = umPluginConfig.Config
-		}
-		s.registerPluginWithStatus(ctx, "aquadoor-usermeter", nil, umCfg, false)
-	} else {
-		s.markPluginDisabled("aquadoor-usermeter")
-		logger.Info("aquadoor-usermeter disabled — set AQUADOOR_USERMETER_ASSERTER_VK to enable per-user cost attribution")
-	}
-	s.Config.SetPluginOrderInfo("aquadoor-usermeter", builtinPlacement, schemas.Ptr(12))
+	// 13. aquadoor-usermeter DELETED (#1814 §1c Stage I): the vouched-email/service-VK cost-attribution
+	// plugin is obsolete under direct per-user VKs — LibreChat presents each user's OWN VK, so cost +
+	// limits are native per-VK and the `user` dimension (logs.user_id) is derived in governance
+	// (StampVirtualKeyScope from the email-shaped VK name). AQUADOOR_USERMETER_* env is retired.
 
 	return nil
 }

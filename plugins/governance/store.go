@@ -1343,6 +1343,20 @@ func StampVirtualKeyScope(ctx *schemas.BifrostContext, virtualKey *configstoreTa
 		ctx.SetValue(schemas.BifrostContextKeyGovernanceCustomerID, virtualKey.Customer.ID)
 		ctx.SetValue(schemas.BifrostContextKeyGovernanceCustomerName, virtualKey.Customer.Name)
 	}
+	// AquaDoor #1814 §1c (Stage F): restore the per-user "user" cost dimension (logs.user_id) without a
+	// vouched header. Under direct per-user VKs the VK NAME is the user's email, so derive user_id from
+	// it. GUARDED two ways: (1) only when nothing already settled a user — so a real IdP subject on the
+	// MCP OAuth2/session path is never shadowed (governance runs in the same choke point); (2) only for
+	// an email-shaped name — so service/system VKs (e.g. "librechat-service", RAG/firecrawl) never
+	// pollute the user dimension with a phantom user. Deliberate fork deviation: BifrostContextKeyUserID
+	// is annotated "set by enterprise auth middleware" upstream (bifrost.go); we set it here for the OSS
+	// direct-VK model. PRESERVE this guard on any upstream merge. (Not a reserved key → SetValue honored.)
+	if strings.Contains(virtualKey.Name, "@") {
+		if existing, _ := ctx.Value(schemas.BifrostContextKeyUserID).(string); existing == "" {
+			ctx.SetValue(schemas.BifrostContextKeyUserID, virtualKey.Name)
+			ctx.SetValue(schemas.BifrostContextKeyUserEmail, virtualKey.Name)
+		}
+	}
 }
 
 // recordVirtualKeyIdentity completes the request's identity with what the presented key resolved to:
