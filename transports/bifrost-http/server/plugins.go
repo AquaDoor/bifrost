@@ -223,14 +223,16 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		return aquadoorobo.NewPlugin(svc, cfg.RunnerClients, aquadoorobo.GovernanceVKNameResolver{}, logger), nil
 
 	case aquadoorusermeter.PluginName:
-		// AquaDoor per-user cost ATTRIBUTION (#1814). In HTTPTransportPreHook (after auth) it stamps a
-		// LibreChat-vouched end-user email (X-Aquadoor-User-Email) as the request's Bifrost user
-		// identity so the logging plugin records cost PER USER (the `user` dimension). It NEVER swaps
-		// the credential — the service VK is kept, so routing/keys/budget/rate are untouched and it can
-		// never break a request. The trusted-asserter VK (the LibreChat service VK) is a SECRET → env,
-		// never config.json (mirrors aquadoor-obo); empty → self-disabled. This plugin is gated ON by
-		// env, NOT a config.json PluginConfigs entry, so pluginConfig is normally nil — only marshal a
-		// non-secret config block when one is actually present (MarshalPluginConfig(nil) errors).
+		// AquaDoor per-user cost + limits (#1814, spec §1b). In HTTPTransportPreHook (after auth) it
+		// stamps a LibreChat-vouched end-user email (X-Aquadoor-User-Email) as the request's Bifrost
+		// user identity (the `user` dimension). With AQUADOOR_USERMETER_BIND on it ALSO rewrites the
+		// request's VK header to the caller's per-user VK, so Bifrost meters cost AND enforces that VK's
+		// budget/rate — the SSOT path — failing closed on an unresolvable VK; off (the dark default) it
+		// is attribution-only and keeps the service VK, so routing cannot break. The trusted-asserter VK
+		// (the LibreChat service VK) is a SECRET → env, never config.json (mirrors aquadoor-obo); empty
+		// → self-disabled. This plugin is gated ON by env, NOT a config.json PluginConfigs entry, so
+		// pluginConfig is normally nil — only marshal a non-secret config block when one is actually
+		// present (MarshalPluginConfig(nil) errors).
 		cfg := &aquadoorusermeter.Config{}
 		if pluginConfig != nil {
 			parsed, err := MarshalPluginConfig[aquadoorusermeter.Config](pluginConfig)
@@ -244,11 +246,43 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		if v := os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK"); v != "" {
 			cfg.AsserterVK = v
 		}
-		return aquadoorusermeter.New(*cfg, logger), nil
+		// Bind flag (spec §1b): dark by default; flipped at the tested Stage-4 cutover.
+		if v := os.Getenv("AQUADOOR_USERMETER_BIND"); v == "1" || v == "true" {
+			cfg.Bind = true
+		}
+		// Wire the email→per-user-VK resolver off the governance store (the SSOT), mirroring how the
+		// routing plugin pulls the governance plugin. Wired whenever governance is present so flipping
+		// the bind flag needs no code change; only the bind path consults it. Bind without a governance
+		// plugin is a hard error — it could not resolve a VK to fail closed against.
+		var usermeterResolver aquadoorusermeter.VirtualKeyResolver
+		if gov, govErr := lib.FindPluginAs[governance.BaseGovernancePlugin](bifrostConfig, governancePluginNameFromContext(ctx)); govErr == nil {
+			usermeterResolver = governanceVKResolver{store: gov.GetGovernanceStore()}
+		} else if cfg.Bind {
+			return nil, fmt.Errorf("aquadoor-usermeter bind requires the governance plugin: %w", govErr)
+		}
+		return aquadoorusermeter.New(*cfg, usermeterResolver, logger), nil
 
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
 	}
+}
+
+// governanceVKResolver adapts the governance store to aquadoor-usermeter's VirtualKeyResolver: it maps
+// a VK NAME (the user's lowercased email) to the per-user VK VALUE governance binds. The store returns
+// the live VK with its value decrypted, so active/expiry are evaluated here and the value never leaves
+// the process. Returns found=false when no VK carries the name.
+type governanceVKResolver struct{ store governance.GovernanceStore }
+
+func (r governanceVKResolver) ResolveVKValueByName(ctx context.Context, name string) (string, bool, bool) {
+	if r.store == nil {
+		return "", false, false
+	}
+	vk, ok := r.store.GetVirtualKeyByName(ctx, name)
+	if !ok || vk == nil {
+		return "", false, false
+	}
+	active := vk.IsActiveValue() && !vk.IsExpiredAt(time.Now())
+	return vk.Value.GetValue(), active, true
 }
 
 // loadCustomPlugin loads a plugin from a shared object file

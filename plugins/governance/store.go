@@ -132,6 +132,11 @@ type GovernanceStore interface {
 	GetGovernanceUsageData(ctx context.Context) *GovernanceData
 	GetVirtualKey(ctx context.Context, vkValue string) (*configstoreTables.TableVirtualKey, bool)
 	GetVirtualKeyByID(ctx context.Context, vkID string) (*configstoreTables.TableVirtualKey, bool)
+	// GetVirtualKeyByName retrieves a virtual key by its NAME — a store-external stable handle, e.g.
+	// the owning user's lowercased email. Unlike value/ID there is no O(1) index for names (names are
+	// not an inference hot-path key), so implementations may scan; callers that resolve per request
+	// must cache. Returns the live VK and true, or (nil,false) when no VK carries that name.
+	GetVirtualKeyByName(ctx context.Context, name string) (*configstoreTables.TableVirtualKey, bool)
 	// ResolvePermits reports the permits a request carries: the ones its caller holds, the permit
 	// scoping the request, and the mode composing them.
 	//
@@ -1236,6 +1241,35 @@ func (gs *LocalGovernanceStore) GetVirtualKeyByID(ctx context.Context, vkID stri
 		return nil, false
 	}
 	return vk, true
+}
+
+// GetVirtualKeyByName retrieves a virtual key by its NAME (lock-free) via an O(n) scan of the
+// ID-keyed index, which holds exactly one live entry per VK (the value-keyed map can hold two during
+// a rotation grace period, so it is not the one scanned here). Names are a cold path — only per-user
+// cost attribution resolves by name, and its caller caches — so no dedicated name index is
+// maintained: a third lock-step index would add write-path risk (storeVirtualKey / the delete paths /
+// the grace-period double-registration) for no hot-path gain. The match is exact; by convention the
+// broker stores a VK's name as the owning user's lowercased email and callers lowercase before asking.
+func (gs *LocalGovernanceStore) GetVirtualKeyByName(_ context.Context, name string) (*configstoreTables.TableVirtualKey, bool) {
+	if name == "" {
+		return nil, false
+	}
+	var found *configstoreTables.TableVirtualKey
+	gs.virtualKeysByID.Range(func(_, value any) bool {
+		vk, ok := value.(*configstoreTables.TableVirtualKey)
+		if !ok || vk == nil {
+			return true // keep scanning
+		}
+		if vk.Name == name {
+			found = vk
+			return false // stop
+		}
+		return true
+	})
+	if found == nil {
+		return nil, false
+	}
+	return found, true
 }
 
 // ResolvePermits reports the permits a request carries. This store knows only about virtual keys,
