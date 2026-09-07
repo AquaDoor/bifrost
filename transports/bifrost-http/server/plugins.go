@@ -437,12 +437,15 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	}
 	s.Config.SetPluginOrderInfo("aquadoor-obo", builtinPlacement, schemas.Ptr(11))
 
-	// 13. AquaDoor per-user LLM cost metering (#1814). HTTPTransportPreAuthHook — swaps a LibreChat-
-	// vouched end-user email to that user's per-user VK BEFORE auth settles identity, so governance
-	// meters cost/budget/rate PER USER. Ships DARK: registers only when the trusted-asserter VK env is
-	// set AND a config store is present (email→VK resolution needs it) — so pre-cutover boots run
-	// pure pass-through. As a PreAuth hook it runs before every PreRequest/PreLLM hook, so its order
-	// relative to governance (4) is irrelevant to correctness; ordered last among builtins.
+	// 13. AquaDoor per-user LLM cost ATTRIBUTION (#1814 §1a). HTTPTransportPreHook (AFTER auth) — when the
+	// caller presents the trusted asserter VK (the LibreChat service VK, this env) AND a vouched
+	// X-Aquadoor-User-Email, it stamps BifrostContextKeyUserID=email so the logging plugin records cost
+	// on the `user` dimension. It NEVER swaps the credential (the request keeps the presented service VK):
+	// no per-user VK, no email→VK store, no PreAuth swap — the VK-swap approach was abandoned (822aaa1)
+	// after it broke LLM routing. Worst case is "one request unattributed"; it early-returns (nil,nil) for
+	// any non-asserter caller — e.g. every per-user-VK MCP call — so it cannot affect routing/auth or
+	// break chat or the MCP path. Ships DARK: registers only when the asserter VK env is set; empty →
+	// pure pass-through. (Per-user LIMITS are LibreChat native Balance, not a per-user VK budget.)
 	if os.Getenv("AQUADOOR_USERMETER_ASSERTER_VK") != "" {
 		umPluginConfig := s.getPluginConfig("aquadoor-usermeter")
 		var umCfg any
